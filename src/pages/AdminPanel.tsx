@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { 
   Users, 
@@ -14,13 +14,22 @@ import {
   XCircle,
   AlertCircle,
   Search,
-  Edit2
+  Edit2,
+  Bot,
+  MessageSquare,
+  FileText,
+  Plus,
+  Ticket,
+  Share2,
+  Layers
 } from 'lucide-react';
 import { Button } from '../components/ui/Button';
 import { Card, CardContent, CardHeader } from '../components/ui/Card';
 import { useAuth } from '../contexts/AuthContext';
 import { Navigate } from 'react-router-dom';
 import { cn } from '../lib/utils';
+
+import ScratchAndPullTabsAdmin from './ScratchAndPullTabsAdmin';
 
 export default function AdminPanel() {
   const { user } = useAuth();
@@ -29,6 +38,11 @@ export default function AdminPanel() {
   const [rainAmountGC, setRainAmountGC] = useState('1000');
   const [rainAmountSC, setRainAmountSC] = useState('1');
 
+  // AI State
+  const [selectedAiChat, setSelectedAiChat] = useState<any>(null);
+  const [chatMessage, setChatMessage] = useState('');
+  const chatEndRef = useRef<HTMLDivElement>(null);
+
   // Fetch Stats
   const { data: stats } = useQuery({
     queryKey: ['admin-stats'],
@@ -36,6 +50,99 @@ export default function AdminPanel() {
       const res = await fetch('/api/admin/stats');
       if (!res.ok) throw new Error('Unauthorized');
       return res.json();
+    }
+  });
+
+  // Fetch AI Employees
+  const { data: aiEmployees } = useQuery({
+    queryKey: ['ai-employees'],
+    queryFn: async () => {
+      const res = await fetch('/api/admin/ai/employees');
+      return res.json();
+    },
+    enabled: activeTab === 'ai-manager' || activeTab === 'ai-employees'
+  });
+
+  // Fetch AI Logs
+  const { data: aiLogs } = useQuery({
+    queryKey: ['ai-logs'],
+    queryFn: async () => {
+      const res = await fetch('/api/admin/ai/logs');
+      return res.json();
+    },
+    enabled: activeTab === 'ai-manager'
+  });
+
+  // Fetch AI Chat
+  const { data: aiChatHistory } = useQuery({
+    queryKey: ['ai-chat', selectedAiChat?.id],
+    queryFn: async () => {
+      if (!selectedAiChat) return { messages: [] };
+      const res = await fetch(`/api/admin/ai/chat/${selectedAiChat.id}`);
+      return res.json();
+    },
+    enabled: !!selectedAiChat,
+    refetchInterval: 3000
+  });
+
+  // Scroll to bottom of chat
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [aiChatHistory]);
+
+  // AI Mutations
+  const sendAiMessageMutation = useMutation({
+    mutationFn: async ({ employeeId, message }: { employeeId: number, message: string }) => {
+      const res = await fetch('/api/admin/ai/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ employeeId, message })
+      });
+      return res.json();
+    },
+    onSuccess: () => {
+      setChatMessage('');
+      queryClient.invalidateQueries({ queryKey: ['ai-chat', selectedAiChat?.id] });
+    }
+  });
+
+  const generateReportsMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch('/api/admin/ai/generate-reports', { method: 'POST' });
+      return res.json();
+    },
+    onSuccess: () => {
+      alert('Reports generated! Check the logs.');
+      queryClient.invalidateQueries({ queryKey: ['ai-logs'] });
+    }
+  });
+
+  const createAiEmployeeMutation = useMutation({
+    mutationFn: async (data: any) => {
+      const res = await fetch('/api/admin/ai/employees', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      });
+      return res.json();
+    },
+    onSuccess: () => {
+      alert('AI Employee created!');
+      queryClient.invalidateQueries({ queryKey: ['ai-employees'] });
+    }
+  });
+
+  const updateAiLogMutation = useMutation({
+    mutationFn: async ({ id, status }: { id: number, status: string }) => {
+      const res = await fetch(`/api/admin/ai/logs/${id}/action`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status })
+      });
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['ai-logs'] });
     }
   });
 
@@ -82,6 +189,20 @@ export default function AdminPanel() {
   const [editingPackage, setEditingPackage] = useState<any>(null);
 
   // Mutations
+  const updateAiEmployeeMutation = useMutation({
+    mutationFn: async ({ id, current_task, status }: { id: number, current_task?: string, status?: string }) => {
+      const res = await fetch(`/api/admin/ai/employees/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ current_task, status })
+      });
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['ai-employees'] });
+    }
+  });
+
   const updateSettingsMutation = useMutation({
     mutationFn: async (newSettings: any) => {
       const res = await fetch('/api/admin/settings', {
@@ -193,6 +314,9 @@ export default function AdminPanel() {
     { id: 'users', label: 'Users & KYC', icon: Users },
     { id: 'redemptions', label: 'Redemptions', icon: DollarSign },
     { id: 'store', label: 'Store & Packages', icon: ShoppingBag },
+    { id: 'ai-manager', label: 'AI Manager', icon: Bot },
+    { id: 'ai-employees', label: 'AI Employees', icon: MessageSquare },
+    { id: 'scratch-pull', label: 'Scratch & Pull', icon: Ticket },
     { id: 'settings', label: 'Settings', icon: Settings },
   ];
 
@@ -577,6 +701,248 @@ export default function AdminPanel() {
         </Card>
       )}
 
+      {activeTab === 'ai-manager' && (
+        <div className="space-y-6 animate-in fade-in duration-500">
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <Card className="lg:col-span-2">
+              <CardHeader className="flex flex-row items-center justify-between">
+                <h3 className="font-bold text-white flex items-center gap-2">
+                  <FileText className="w-5 h-5 text-blue-500" />
+                  AI Employee Logs & Reports
+                </h3>
+                <Button 
+                  size="sm" 
+                  onClick={() => generateReportsMutation.mutate()}
+                  disabled={generateReportsMutation.isPending}
+                >
+                  {generateReportsMutation.isPending ? 'Generating...' : 'Generate Daily Reports'}
+                </Button>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-4 max-h-[600px] overflow-y-auto pr-2">
+                  {aiLogs?.logs?.length === 0 && (
+                    <div className="text-center py-12 text-slate-500 italic">
+                      No reports or logs found.
+                    </div>
+                  )}
+                  {aiLogs?.logs?.map((log: any) => (
+                    <div key={log.id} className="p-4 bg-slate-900/50 border border-white/5 rounded-xl">
+                      <div className="flex items-start justify-between mb-2">
+                        <div className="flex items-center gap-3">
+                          <img src={log.avatar_url} alt={log.employee_name} className="w-8 h-8 rounded-full bg-slate-800" />
+                          <div>
+                            <p className="text-sm font-bold text-white">{log.employee_name}</p>
+                            <p className="text-[10px] text-slate-500 font-mono">{new Date(log.created_at).toLocaleString()}</p>
+                          </div>
+                        </div>
+                        <span className={cn(
+                          "px-2 py-0.5 rounded text-[10px] font-bold uppercase",
+                          log.status === 'pending' ? "bg-yellow-500/10 text-yellow-500" :
+                          log.status === 'approved' ? "bg-emerald-500/10 text-emerald-500" :
+                          "bg-red-500/10 text-red-500"
+                        )}>
+                          {log.status}
+                        </span>
+                      </div>
+                      <p className="text-sm text-slate-300 leading-relaxed italic">"{log.content}"</p>
+                      {log.status === 'pending' && (
+                        <div className="flex gap-2 mt-4">
+                          <Button 
+                            size="sm" 
+                            className="h-7 text-[10px] bg-emerald-500/20 text-emerald-500 hover:bg-emerald-500/30"
+                            onClick={() => updateAiLogMutation.mutate({ id: log.id, status: 'approved' })}
+                          >
+                            Approve Suggestion
+                          </Button>
+                          <Button 
+                            size="sm" 
+                            className="h-7 text-[10px] bg-red-500/20 text-red-500 hover:bg-red-500/30"
+                            onClick={() => updateAiLogMutation.mutate({ id: log.id, status: 'denied' })}
+                          >
+                            Deny
+                          </Button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <h3 className="font-bold text-white flex items-center gap-2">
+                  <Plus className="w-5 h-5 text-emerald-500" />
+                  Create New AI Employee
+                </h3>
+              </CardHeader>
+              <CardContent>
+                <form 
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const formData = new FormData(e.currentTarget);
+                    createAiEmployeeMutation.mutate({
+                      name: formData.get('name'),
+                      role: formData.get('role'),
+                      description: formData.get('description')
+                    });
+                    (e.target as HTMLFormElement).reset();
+                  }}
+                  className="space-y-4"
+                >
+                  <div>
+                    <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Name</label>
+                    <input name="name" required className="w-full bg-slate-900 border border-white/10 rounded-lg px-3 py-2 text-sm text-white" placeholder="e.g. MarketingAi" />
+                  </div>
+                  <div>
+                    <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Role</label>
+                    <input name="role" required className="w-full bg-slate-900 border border-white/10 rounded-lg px-3 py-2 text-sm text-white" placeholder="e.g. Social Media Manager" />
+                  </div>
+                  <div>
+                    <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Description / Tasks</label>
+                    <textarea name="description" required rows={4} className="w-full bg-slate-900 border border-white/10 rounded-lg px-3 py-2 text-sm text-white" placeholder="Describe what this AI should focus on..." />
+                  </div>
+                  <Button type="submit" className="w-full" disabled={createAiEmployeeMutation.isPending}>
+                    {createAiEmployeeMutation.isPending ? 'Creating...' : 'Deploy AI Employee'}
+                  </Button>
+                </form>
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'ai-employees' && (
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 animate-in fade-in duration-500 h-[700px]">
+          {/* Employee List */}
+          <Card className="lg:col-span-1 overflow-y-auto">
+            <CardHeader>
+              <h3 className="font-bold text-white">AI Staff</h3>
+            </CardHeader>
+            <CardContent className="p-2">
+              <div className="space-y-1">
+                {aiEmployees?.employees?.map((emp: any) => (
+                  <button
+                    key={emp.id}
+                    onClick={() => setSelectedAiChat(emp)}
+                    className={cn(
+                      "w-full flex items-center gap-3 p-3 rounded-xl transition-all text-left",
+                      selectedAiChat?.id === emp.id ? "bg-blue-600/10 border border-blue-500/20" : "hover:bg-white/5"
+                    )}
+                  >
+                    <div className="relative">
+                      <img src={emp.avatar_url} alt={emp.name} className="w-10 h-10 rounded-full bg-slate-800" />
+                      <div className={cn(
+                        "absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-[#020617]",
+                        emp.status === 'active' ? "bg-emerald-500" : "bg-slate-500"
+                      )} />
+                    </div>
+                    <div className="overflow-hidden">
+                      <p className="text-sm font-bold text-white truncate">{emp.name}</p>
+                      <p className="text-[10px] text-slate-500 truncate">{emp.role}</p>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* Chat Area */}
+          <Card className="lg:col-span-3 flex flex-col">
+            {selectedAiChat ? (
+              <>
+                <CardHeader className="border-b border-white/5 flex flex-row items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <img src={selectedAiChat.avatar_url} alt={selectedAiChat.name} className="w-10 h-10 rounded-full bg-slate-800" />
+                    <div>
+                      <h3 className="font-bold text-white">{selectedAiChat.name}</h3>
+                      <p className="text-xs text-slate-500">{selectedAiChat.role}</p>
+                    </div>
+                  </div>
+                  <div className="text-right flex flex-col items-end gap-1">
+                    <p className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Current Task</p>
+                    <div className="flex items-center gap-2">
+                      <input 
+                        className="bg-slate-900 border border-white/5 rounded px-2 py-1 text-xs text-blue-400 italic focus:outline-none focus:border-blue-500/50 w-48"
+                        defaultValue={selectedAiChat.current_task || ''}
+                        onBlur={(e) => {
+                          if (e.target.value !== selectedAiChat.current_task) {
+                            updateAiEmployeeMutation.mutate({ id: selectedAiChat.id, current_task: e.target.value });
+                          }
+                        }}
+                        placeholder="Assign a new task..."
+                      />
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent className="flex-1 overflow-y-auto p-6 space-y-4">
+                  {aiChatHistory?.messages?.map((msg: any) => (
+                    <div key={msg.id} className={cn(
+                      "flex flex-col max-w-[80%]",
+                      msg.sender === 'admin' ? "ml-auto items-end" : "items-start"
+                    )}>
+                      <div className={cn(
+                        "p-3 rounded-2xl text-sm",
+                        msg.sender === 'admin' ? "bg-blue-600 text-white rounded-tr-none" : "bg-slate-800 text-slate-200 rounded-tl-none"
+                      )}>
+                        {msg.message}
+                      </div>
+                      <span className="text-[10px] text-slate-500 mt-1 font-mono">
+                        {new Date(msg.created_at).toLocaleTimeString()}
+                      </span>
+                    </div>
+                  ))}
+                  <div ref={chatEndRef} />
+                </CardContent>
+                <div className="p-4 border-t border-white/5">
+                  <form 
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      if (!chatMessage.trim()) return;
+                      sendAiMessageMutation.mutate({ employeeId: selectedAiChat.id, message: chatMessage });
+                    }}
+                    className="flex gap-2"
+                  >
+                    <input 
+                      value={chatMessage}
+                      onChange={(e) => setChatMessage(e.target.value)}
+                      placeholder={`Message ${selectedAiChat.name}...`}
+                      className="flex-1 bg-slate-900 border border-white/10 rounded-xl px-4 py-2 text-sm text-white focus:outline-none focus:border-blue-500/50"
+                    />
+                    <Button type="submit" disabled={sendAiMessageMutation.isPending}>
+                      {sendAiMessageMutation.isPending ? '...' : 'Send'}
+                    </Button>
+                  </form>
+                </div>
+              </>
+            ) : (
+              <div className="flex-1 flex flex-col items-center justify-center text-slate-500 space-y-4">
+                <Bot className="w-16 h-16 opacity-10" />
+                <p className="font-medium italic">Select an AI Employee to start a private consultation</p>
+              </div>
+            )}
+          </Card>
+        </div>
+      )}
+
+      {activeTab === 'scratch-pull' && (
+        <div className="animate-in fade-in duration-500">
+          <ScratchAndPullTabsAdmin />
+        </div>
+      )}
+
+      {activeTab === 'scratch-pull' && (
+        <div className="animate-in fade-in duration-500">
+          <ScratchAndPullTabsAdmin />
+        </div>
+      )}
+
+      {activeTab === 'scratch-pull' && (
+        <div className="animate-in fade-in duration-500">
+          <ScratchAndPullTabsAdmin />
+        </div>
+      )}
+
       {activeTab === 'settings' && (
         <Card className="animate-in fade-in duration-500">
           <CardHeader>
@@ -622,24 +988,63 @@ export default function AdminPanel() {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <label className="text-xs font-bold text-slate-500 uppercase">Signup Bonus (GC)</label>
-                    <input 
-                      name="signup_bonus_gc" 
-                      type="number"
-                      defaultValue={settings.signup_bonus_gc} 
-                      className="w-full bg-slate-950 border border-white/10 rounded-lg px-4 py-2 text-white"
-                    />
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div className="space-y-4">
+                    <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                      <Share2 className="w-4 h-4 text-blue-400" />
+                      Social & Referral
+                    </h4>
+                    <div className="space-y-3">
+                      <div>
+                        <label className="text-xs font-bold text-slate-500 uppercase">Referral Bonus (GC)</label>
+                        <input 
+                          className="w-full bg-slate-950 border border-white/10 rounded-lg px-4 py-2 text-white"
+                          defaultValue={settings?.referral_bonus_gc}
+                          onBlur={(e) => updateSettingsMutation.mutate({ referral_bonus_gc: e.target.value })}
+                        />
+                      </div>
+                      <div>
+                        <label className="text-xs font-bold text-slate-500 uppercase">Referral Bonus (SC)</label>
+                        <input 
+                          className="w-full bg-slate-950 border border-white/10 rounded-lg px-4 py-2 text-white"
+                          defaultValue={settings?.referral_bonus_sc}
+                          onBlur={(e) => updateSettingsMutation.mutate({ referral_bonus_sc: e.target.value })}
+                        />
+                      </div>
+                      <div>
+                        <label className="text-xs font-bold text-slate-500 uppercase">Share Template</label>
+                        <textarea 
+                          className="w-full bg-slate-950 border border-white/10 rounded-lg px-4 py-2 text-white"
+                          rows={4}
+                          defaultValue={settings?.social_share_template}
+                          onBlur={(e) => updateSettingsMutation.mutate({ social_share_template: e.target.value })}
+                        />
+                      </div>
+                    </div>
                   </div>
-                  <div className="space-y-2">
-                    <label className="text-xs font-bold text-slate-500 uppercase">Signup Bonus (SC)</label>
-                    <input 
-                      name="signup_bonus_sc" 
-                      type="number"
-                      defaultValue={settings.signup_bonus_sc} 
-                      className="w-full bg-slate-950 border border-white/10 rounded-lg px-4 py-2 text-white"
-                    />
+                  <div className="space-y-4">
+                    <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                      <Layers className="w-4 h-4 text-purple-400" />
+                      Game Settings
+                    </h4>
+                    <div className="space-y-3">
+                      <div>
+                        <label className="text-xs font-bold text-slate-500 uppercase">Min Redemption SC</label>
+                        <input 
+                          className="w-full bg-slate-950 border border-white/10 rounded-lg px-4 py-2 text-white"
+                          defaultValue={settings?.min_redemption_sc}
+                          onBlur={(e) => updateSettingsMutation.mutate({ min_redemption_sc: e.target.value })}
+                        />
+                      </div>
+                      <div className="flex items-center justify-between p-3 bg-slate-950 rounded-xl border border-white/5">
+                        <span className="text-sm text-slate-300">Enable Facebook Share</span>
+                        <input type="checkbox" defaultChecked={settings?.enable_social_facebook === 'true'} onChange={(e) => updateSettingsMutation.mutate({ enable_social_facebook: e.target.checked.toString() })} />
+                      </div>
+                      <div className="flex items-center justify-between p-3 bg-slate-950 rounded-xl border border-white/5">
+                        <span className="text-sm text-slate-300">Enable Twitter Share</span>
+                        <input type="checkbox" defaultChecked={settings?.enable_social_twitter === 'true'} onChange={(e) => updateSettingsMutation.mutate({ enable_social_twitter: e.target.checked.toString() })} />
+                      </div>
+                    </div>
                   </div>
                 </div>
                 

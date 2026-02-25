@@ -8,6 +8,7 @@ import dotenv from 'dotenv';
 import Database from 'better-sqlite3';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import { GoogleGenAI } from "@google/genai";
 
 dotenv.config();
 
@@ -18,6 +19,8 @@ const io = new Server(httpServer, {
     origin: '*',
   }
 });
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'coinkrazy-secret-key-123';
 
@@ -279,6 +282,99 @@ db.exec(`
     image_url TEXT,
     is_featured INTEGER DEFAULT 0
   );
+
+  CREATE TABLE IF NOT EXISTS ai_employees (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL,
+    description TEXT,
+    status TEXT DEFAULT 'active', -- active, idle, maintenance
+    current_task TEXT,
+    avatar_url TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS ai_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    employee_id INTEGER NOT NULL,
+    type TEXT NOT NULL, -- review, suggestion, alert, task_update
+    content TEXT NOT NULL,
+    status TEXT DEFAULT 'pending', -- pending, approved, denied, read
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(employee_id) REFERENCES ai_employees(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS ai_chats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    employee_id INTEGER NOT NULL,
+    sender TEXT NOT NULL, -- admin, ai
+    message TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(employee_id) REFERENCES ai_employees(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS ticket_types (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL, -- 'scratch' or 'pulltab'
+    name TEXT NOT NULL,
+    description TEXT,
+    price_sc REAL NOT NULL,
+    win_probability REAL DEFAULT 0.142857, -- 1/7
+    min_prize REAL DEFAULT 0.01,
+    max_prize REAL DEFAULT 10.00,
+    theme_images TEXT, -- JSON array of image URLs
+    color_scheme TEXT,
+    is_active INTEGER DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS ticket_purchases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL,
+    ticket_type_id INTEGER NOT NULL,
+    cost_sc REAL NOT NULL,
+    win_amount REAL DEFAULT 0,
+    is_win INTEGER DEFAULT 0,
+    result_data TEXT, -- JSON details of the reveal
+    status TEXT DEFAULT 'purchased', -- purchased, revealed, claimed, saved
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(player_id) REFERENCES players(id),
+    FOREIGN KEY(ticket_type_id) REFERENCES ticket_types(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS user_saved_wins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL,
+    purchase_id INTEGER NOT NULL,
+    ticket_name TEXT NOT NULL,
+    amount_won REAL NOT NULL,
+    image_url TEXT,
+    claimed INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(player_id) REFERENCES players(id),
+    FOREIGN KEY(purchase_id) REFERENCES ticket_purchases(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS social_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL,
+    platform TEXT NOT NULL, -- 'facebook', 'twitter', 'instagram', 'tiktok'
+    platform_user_id TEXT,
+    platform_username TEXT,
+    access_token TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(player_id, platform),
+    FOREIGN KEY(player_id) REFERENCES players(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS activity_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER,
+    action TEXT NOT NULL,
+    details TEXT,
+    ip_address TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
 `);
 
 // Migration for existing DB
@@ -311,6 +407,11 @@ const initSettings = () => {
     'enable_googlepay': 'true',
     'redemption_fee': '5',
     'min_redemption_sc': '100',
+    'social_share_template': 'Just won {amount} SC on PlayCoinKrazy.com playing {ticket}! 🔥 Come play with me and use my referral code {code} for 1000 GC + 1 SC bonus when you sign up! → https://playcoinkrazy.com/register?ref={code}',
+    'enable_social_facebook': 'true',
+    'enable_social_twitter': 'true',
+    'enable_social_instagram': 'true',
+    'enable_social_tiktok': 'true',
   };
   
   const insert = db.prepare('INSERT OR IGNORE INTO site_settings (key, value) VALUES (?, ?)');
@@ -330,6 +431,28 @@ const seedPackages = () => {
 };
 
 seedPackages();
+
+// Seed AI Employees
+const seedAiEmployees = () => {
+  const employees = [
+    { name: 'DevAi', role: 'Game Editor & Builder', description: 'Helps build and edit games, fix bugs, and optimize performance.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=DevAi' },
+    { name: 'SecurityAi', role: 'Site Security', description: 'Monitors site safety, detects anomalies, and ensures player protection.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=SecurityAi' },
+    { name: 'PlayersAi', role: 'Player Support', description: 'Assists with KYC verification, player inquiries, and support tickets.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=PlayersAi' },
+    { name: 'AdminAi', role: 'Admin Assistant', description: 'Suggests site updates, manages settings, and compiles reports.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=AdminAi' },
+    { name: 'SlotsAi', role: 'Slots Monitor', description: 'Monitors slots for cheating, verifies RTP, and checks for errors.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=SlotsAi' },
+  ];
+
+  const insert = db.prepare('INSERT OR IGNORE INTO ai_employees (name, role, description, avatar_url) VALUES (?, ?, ?, ?)');
+  const check = db.prepare('SELECT id FROM ai_employees WHERE name = ?');
+  
+  employees.forEach(e => {
+    if (!check.get(e.name)) {
+      insert.run(e.name, e.role, e.description, e.avatar_url);
+    }
+  });
+};
+
+seedAiEmployees();
 
 initSettings();
 
@@ -1425,6 +1548,470 @@ setInterval(() => {
     console.error('Tournament Scheduler Error:', error);
   }
 }, 60000); // Check every minute
+
+// Ticket Management Endpoints
+app.post('/api/admin/tickets/types', authenticate, isAdmin, async (req: any, res) => {
+  const { type, price_sc, custom_name, custom_description } = req.body;
+  
+  try {
+    let name = custom_name;
+    let description = custom_description;
+    let theme_images = [];
+
+    // Use DevAi to generate theme if not provided
+    if (!name) {
+      const prompt = `Generate a fun, catchy theme name and a short description for a ${type === 'scratch' ? 'Scratch-off' : 'Pull Tab'} ticket. 
+      The theme should be exciting and gambling-related (e.g., space, pirates, gems, luck). 
+      Return JSON format: { "name": "...", "description": "..." }`;
+      
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: prompt,
+        config: { responseMimeType: 'application/json' }
+      });
+      
+      const theme = JSON.parse(response.text || '{}');
+      name = theme.name || 'Lucky Ticket';
+      description = theme.description || 'Try your luck today!';
+    }
+
+    // Generate theme images using Gemini (simulated with picsum for now but structure is there)
+    // In a real scenario, we'd use gemini-2.5-flash-image
+    theme_images = [
+      `https://picsum.photos/seed/${name}-1/800/600`,
+      `https://picsum.photos/seed/${name}-2/800/600`,
+      `https://picsum.photos/seed/${name}-3/800/600`
+    ];
+
+    const result = db.prepare(`
+      INSERT INTO ticket_types (type, name, description, price_sc, theme_images)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(type, name, description, price_sc, JSON.stringify(theme_images));
+
+    res.json({ success: true, id: result.lastInsertRowid, name, description, theme_images });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/tickets/types', authenticate, isAdmin, (req: any, res) => {
+  try {
+    const types = db.prepare('SELECT * FROM ticket_types ORDER BY created_at DESC').all();
+    res.json({ types });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/admin/tickets/types/:id', authenticate, isAdmin, (req: any, res) => {
+  const { id } = req.params;
+  const { is_active, price_sc, win_probability } = req.body;
+  
+  try {
+    const updates: string[] = [];
+    const params: any[] = [];
+    
+    if (is_active !== undefined) { updates.push('is_active = ?'); params.push(is_active ? 1 : 0); }
+    if (price_sc !== undefined) { updates.push('price_sc = ?'); params.push(price_sc); }
+    if (win_probability !== undefined) { updates.push('win_probability = ?'); params.push(win_probability); }
+    
+    if (updates.length > 0) {
+      params.push(id);
+      db.prepare(`UPDATE ticket_types SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+    }
+    
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/tickets/stats', authenticate, isAdmin, (req: any, res) => {
+  try {
+    const stats = db.prepare(`
+      SELECT 
+        COUNT(*) as total_sold,
+        SUM(cost_sc) as total_revenue,
+        SUM(win_amount) as total_payout,
+        (SUM(cost_sc) - SUM(win_amount)) as net_profit
+      FROM ticket_purchases
+    `).get() as any;
+
+    const topWinners = db.prepare(`
+      SELECT p.username, SUM(tp.win_amount) as total_won
+      FROM ticket_purchases tp
+      JOIN players p ON tp.player_id = p.id
+      WHERE tp.is_win = 1
+      GROUP BY p.id
+      ORDER BY total_won DESC
+      LIMIT 10
+    `).all();
+
+    const salesHistory = db.prepare(`
+      SELECT date(created_at) as date, SUM(cost_sc) as revenue, SUM(win_amount) as payout
+      FROM ticket_purchases
+      GROUP BY date(created_at)
+      ORDER BY date ASC
+      LIMIT 30
+    `).all();
+
+    res.json({ stats, topWinners, salesHistory });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// User Ticket Endpoints
+app.get('/api/tickets/active', (req, res) => {
+  try {
+    const types = db.prepare('SELECT * FROM ticket_types WHERE is_active = 1').all();
+    res.json({ types });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/tickets/purchase', authenticate, (req: any, res) => {
+  const { ticketTypeId } = req.body;
+  
+  try {
+    const user = db.prepare('SELECT sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
+    const ticketType = db.prepare('SELECT * FROM ticket_types WHERE id = ? AND is_active = 1').get(ticketTypeId) as any;
+    
+    if (!ticketType) return res.status(404).json({ error: 'Ticket type not found or inactive' });
+    if (user.sc_balance < ticketType.price_sc) return res.status(400).json({ error: 'Insufficient SC balance' });
+
+    // Rate limiting check (simple version)
+    const recentPurchases = db.prepare(`
+      SELECT COUNT(*) as count FROM ticket_purchases 
+      WHERE player_id = ? AND created_at > datetime('now', '-1 minute')
+    `).get(req.user.id) as any;
+    
+    if (recentPurchases.count >= 50) return res.status(429).json({ error: 'Rate limit exceeded. Max 50 tickets per minute.' });
+
+    // Determine win/loss
+    const winRoll = Math.random();
+    const isWin = winRoll < ticketType.win_probability;
+    let winAmount = 0;
+    
+    if (isWin) {
+      // Uniform distribution between min and max prize
+      winAmount = Math.random() * (ticketType.max_prize - ticketType.min_prize) + ticketType.min_prize;
+      winAmount = parseFloat(winAmount.toFixed(2));
+    }
+
+    const transaction = db.transaction(() => {
+      // Deduct balance
+      db.prepare('UPDATE players SET sc_balance = sc_balance - ? WHERE id = ?')
+        .run(ticketType.price_sc, req.user.id);
+      
+      // Create purchase record
+      const result = db.prepare(`
+        INSERT INTO ticket_purchases (player_id, ticket_type_id, cost_sc, win_amount, is_win, result_data, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(req.user.id, ticketTypeId, ticketType.price_sc, winAmount, isWin ? 1 : 0, JSON.stringify({ winAmount, isWin }), 'purchased');
+      
+      return result.lastInsertRowid;
+    });
+
+    const purchaseId = transaction();
+    
+    // Notify balance update
+    const updatedUser = db.prepare('SELECT sc_balance, gc_balance FROM players WHERE id = ?').get(req.user.id) as any;
+    io.to(`user-${req.user.id}`).emit('balance-update', updatedUser);
+
+    res.json({ success: true, purchaseId, price: ticketType.price_sc });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/tickets/reveal', authenticate, (req: any, res) => {
+  const { purchaseId } = req.body;
+  
+  try {
+    const purchase = db.prepare(`
+      SELECT tp.*, tt.name as ticket_name, tt.type as ticket_type
+      FROM ticket_purchases tp
+      JOIN ticket_types tt ON tp.ticket_type_id = tt.id
+      WHERE tp.id = ? AND tp.player_id = ? AND tp.status = 'purchased'
+    `).get(purchaseId, req.user.id) as any;
+    
+    if (!purchase) return res.status(404).json({ error: 'Purchase not found or already revealed' });
+
+    db.prepare("UPDATE ticket_purchases SET status = 'revealed' WHERE id = ?").run(purchaseId);
+
+    res.json({ 
+      isWin: purchase.is_win === 1, 
+      winAmount: purchase.win_amount,
+      ticketName: purchase.ticket_name,
+      ticketType: purchase.ticket_type
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/tickets/claim', authenticate, (req: any, res) => {
+  const { purchaseId } = req.body;
+  
+  try {
+    const purchase = db.prepare("SELECT * FROM ticket_purchases WHERE id = ? AND player_id = ? AND status = 'revealed'").get(purchaseId, req.user.id) as any;
+    
+    if (!purchase) return res.status(404).json({ error: 'Purchase not found or not in revealed state' });
+    
+    if (purchase.is_win === 1) {
+      db.transaction(() => {
+        db.prepare('UPDATE players SET sc_balance = sc_balance + ? WHERE id = ?')
+          .run(purchase.win_amount, req.user.id);
+        db.prepare("UPDATE ticket_purchases SET status = 'claimed' WHERE id = ?").run(purchaseId);
+        
+        db.prepare('INSERT INTO wallet_transactions (player_id, type, sc_amount, description) VALUES (?, ?, ?, ?)')
+          .run(req.user.id, 'ticket_win', purchase.win_amount, `Won ${purchase.win_amount} SC on ticket #${purchaseId}`);
+      })();
+      
+      const updatedUser = db.prepare('SELECT sc_balance, gc_balance FROM players WHERE id = ?').get(req.user.id) as any;
+      io.to(`user-${req.user.id}`).emit('balance-update', updatedUser);
+    } else {
+      db.prepare("UPDATE ticket_purchases SET status = 'claimed' WHERE id = ?").run(purchaseId);
+    }
+
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/tickets/save', authenticate, (req: any, res) => {
+  const { purchaseId } = req.body;
+  
+  try {
+    const purchase = db.prepare(`
+      SELECT tp.*, tt.name as ticket_name, tt.theme_images
+      FROM ticket_purchases tp
+      JOIN ticket_types tt ON tp.ticket_type_id = tt.id
+      WHERE tp.id = ? AND tp.player_id = ? AND tp.status = 'revealed' AND tp.is_win = 1
+    `).get(purchaseId, req.user.id) as any;
+    
+    if (!purchase) return res.status(404).json({ error: 'Winning purchase not found or not in revealed state' });
+    
+    const images = JSON.parse(purchase.theme_images || '[]');
+    const imageUrl = images[0] || '';
+
+    db.transaction(() => {
+      db.prepare("UPDATE ticket_purchases SET status = 'saved' WHERE id = ?").run(purchaseId);
+      db.prepare(`
+        INSERT INTO user_saved_wins (player_id, purchase_id, ticket_name, amount_won, image_url)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(req.user.id, purchaseId, purchase.ticket_name, purchase.win_amount, imageUrl);
+    })();
+
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/user/saved-wins', authenticate, (req: any, res) => {
+  try {
+    const wins = db.prepare('SELECT * FROM user_saved_wins WHERE player_id = ? AND claimed = 0 ORDER BY created_at DESC').all(req.user.id);
+    res.json({ wins });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Social & Referral Endpoints
+app.post('/api/user/social/connect', authenticate, (req: any, res) => {
+  const { platform, platform_username } = req.body;
+  
+  try {
+    db.prepare(`
+      INSERT OR REPLACE INTO social_links (player_id, platform, platform_username)
+      VALUES (?, ?, ?)
+    `).run(req.user.id, platform, platform_username);
+    
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/user/referrals', authenticate, (req: any, res) => {
+  try {
+    const friends = db.prepare(`
+      SELECT id, username, avatar_url, created_at
+      FROM players
+      WHERE referred_by = ?
+    `).all(req.user.id);
+    
+    res.json({ friends });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// AI Manager Endpoints
+app.get('/api/admin/ai/employees', authenticate, isAdmin, (req: any, res) => {
+  try {
+    const employees = db.prepare('SELECT * FROM ai_employees').all();
+    res.json({ employees });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/ai/employees', authenticate, isAdmin, (req: any, res) => {
+  const { name, role, description } = req.body;
+  try {
+    const result = db.prepare('INSERT INTO ai_employees (name, role, description, avatar_url) VALUES (?, ?, ?, ?)')
+      .run(name, role, description, `https://api.dicebear.com/7.x/bottts/svg?seed=${name}`);
+    res.json({ success: true, id: result.lastInsertRowid });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/admin/ai/employees/:id', authenticate, isAdmin, (req: any, res) => {
+  const { id } = req.params;
+  const { current_task, status } = req.body;
+  try {
+    if (current_task !== undefined) {
+      db.prepare('UPDATE ai_employees SET current_task = ? WHERE id = ?').run(current_task, id);
+    }
+    if (status !== undefined) {
+      db.prepare('UPDATE ai_employees SET status = ? WHERE id = ?').run(status, id);
+    }
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/ai/logs', authenticate, isAdmin, (req: any, res) => {
+  try {
+    const logs = db.prepare(`
+      SELECT l.*, e.name as employee_name, e.avatar_url 
+      FROM ai_logs l
+      JOIN ai_employees e ON l.employee_id = e.id
+      ORDER BY l.created_at DESC
+      LIMIT 50
+    `).all();
+    res.json({ logs });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/ai/logs/:id/action', authenticate, isAdmin, (req: any, res) => {
+  const { id } = req.params;
+  const { status } = req.body; // approved, denied
+  try {
+    db.prepare('UPDATE ai_logs SET status = ? WHERE id = ?').run(status, id);
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/ai/chat/:employeeId', authenticate, isAdmin, (req: any, res) => {
+  const { employeeId } = req.params;
+  try {
+    const messages = db.prepare('SELECT * FROM ai_chats WHERE employee_id = ? ORDER BY created_at ASC').all(employeeId);
+    res.json({ messages });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/ai/chat', authenticate, isAdmin, async (req: any, res) => {
+  const { employeeId, message } = req.body;
+  
+  try {
+    // Save user message
+    db.prepare('INSERT INTO ai_chats (employee_id, sender, message) VALUES (?, ?, ?)').run(employeeId, 'admin', message);
+    
+    // Get AI context
+    const employee = db.prepare('SELECT * FROM ai_employees WHERE id = ?').get(employeeId) as any;
+    
+    // Generate AI response using Gemini
+    // Note: In a real app, we would inject system stats/context here
+    const prompt = `You are ${employee.name}, a ${employee.role} for an online casino platform. 
+    Your description: ${employee.description}.
+    Current task: ${employee.current_task || 'Idle'}.
+    
+    The admin just said: "${message}"
+    
+    Respond in character. Keep it professional but fitting for your persona.`;
+    
+    const aiResponse = await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: prompt
+    });
+    
+    const responseText = aiResponse.text || "I'm processing that request.";
+    
+    // Save AI response
+    db.prepare('INSERT INTO ai_chats (employee_id, sender, message) VALUES (?, ?, ?)').run(employeeId, 'ai', responseText);
+    
+    res.json({ success: true, message: responseText });
+  } catch (error: any) {
+    console.error('AI Chat Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/ai/generate-reports', authenticate, isAdmin, async (req: any, res) => {
+  try {
+    const employees = db.prepare('SELECT * FROM ai_employees').all() as any[];
+    
+    // Generate a report for each employee
+    for (const emp of employees) {
+      const prompt = `You are ${emp.name}, a ${emp.role}. Generate a short daily review/report for the admin.
+      Include 1 specific suggestion for improvement and 1 status update on your current duties.
+      Keep it concise (under 50 words).`;
+      
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: prompt
+      });
+      
+      const content = response.text || "Daily report generation failed.";
+      
+      db.prepare('INSERT INTO ai_logs (employee_id, type, content, status) VALUES (?, ?, ?, ?)')
+        .run(emp.id, 'review', content, 'pending');
+    }
+    
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Daily AI Report Generation (Simulated every 12 hours)
+setInterval(async () => {
+  try {
+    const employees = db.prepare('SELECT * FROM ai_employees').all() as any[];
+    for (const emp of employees) {
+      const prompt = `You are ${emp.name}, a ${emp.role}. Generate a short daily review/report for the admin.
+      Include 1 specific suggestion for improvement and 1 status update on your current duties.
+      Keep it concise (under 50 words).`;
+      
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: prompt
+      });
+      
+      const content = response.text || "Daily report generation failed.";
+      
+      db.prepare('INSERT INTO ai_logs (employee_id, type, content, status) VALUES (?, ?, ?, ?)')
+        .run(emp.id, 'review', content, 'pending');
+    }
+    console.log('Automatic AI Reports Generated');
+  } catch (error) {
+    console.error('Auto Report Error:', error);
+  }
+}, 12 * 60 * 60 * 1000);
 
 // Package Management
 app.post('/api/admin/packages', authenticate, (req: any, res) => {
