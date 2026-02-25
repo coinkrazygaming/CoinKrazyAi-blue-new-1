@@ -1,0 +1,9 @@
+{
+  "name": "CoinKrazy AI",
+  "description": "A comprehensive social gaming and entertainment platform with AI-powered features, dual-currency system, and real-time social interactions.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ]
+}
