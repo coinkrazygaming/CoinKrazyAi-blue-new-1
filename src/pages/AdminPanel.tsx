@@ -21,7 +21,11 @@ import {
   Plus,
   Ticket,
   Share2,
-  Layers
+  Layers,
+  Bell,
+  Gamepad2,
+  Megaphone,
+  HelpCircle
 } from 'lucide-react';
 import { Button } from '../components/ui/Button';
 import { Card, CardContent, CardHeader } from '../components/ui/Card';
@@ -30,11 +34,18 @@ import { Navigate } from 'react-router-dom';
 import { cn } from '../lib/utils';
 
 import ScratchAndPullTabsAdmin from './ScratchAndPullTabsAdmin';
+import AdminNotifications from '../components/admin/AdminNotifications';
+import ManageGames from '../components/admin/ManageGames';
+import SocialManager from '../components/admin/SocialManager';
+import AiGameBuilder from '../components/admin/AiGameBuilder';
+import { BonusManager } from '../components/BonusManager';
+import { CommunityManager } from '../components/CommunityManager';
 
 export default function AdminPanel() {
   const { user } = useAuth();
   const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState('dashboard');
+  const [editingGameId, setEditingGameId] = useState<number | null>(null);
   const [rainAmountGC, setRainAmountGC] = useState('1000');
   const [rainAmountSC, setRainAmountSC] = useState('1');
 
@@ -311,13 +322,19 @@ export default function AdminPanel() {
 
   const tabs = [
     { id: 'dashboard', label: 'Dashboard', icon: Activity },
+    { id: 'notifications', label: 'Notifications', icon: Bell },
+    { id: 'games', label: 'Manage Games', icon: Gamepad2 },
+    { id: 'social', label: 'Social & Marketing', icon: Megaphone },
     { id: 'users', label: 'Users & KYC', icon: Users },
     { id: 'redemptions', label: 'Redemptions', icon: DollarSign },
     { id: 'store', label: 'Store & Packages', icon: ShoppingBag },
     { id: 'ai-manager', label: 'AI Manager', icon: Bot },
     { id: 'ai-employees', label: 'AI Employees', icon: MessageSquare },
     { id: 'scratch-pull', label: 'Scratch & Pull', icon: Ticket },
+    { id: 'bonuses', label: 'Bonuses', icon: Gift },
+    { id: 'community-moderation', label: 'Community', icon: ShieldAlert },
     { id: 'settings', label: 'Settings', icon: Settings },
+    { id: 'help', label: 'Help', icon: HelpCircle },
   ];
 
   return (
@@ -343,6 +360,11 @@ export default function AdminPanel() {
         </div>
       </div>
 
+      {activeTab === 'notifications' && <AdminNotifications />}
+      {activeTab === 'games' && <ManageGames onOpenBuilder={(gameId) => { setActiveTab('game-builder'); setEditingGameId(gameId); }} />}
+      {activeTab === 'game-builder' && <AiGameBuilder gameId={editingGameId} onClose={() => setActiveTab('games')} />}
+      {activeTab === 'social' && <SocialManager />}
+      
       {activeTab === 'dashboard' && (
         <div className="space-y-8 animate-in fade-in duration-500">
           {/* Stats Grid */}
@@ -931,15 +953,15 @@ export default function AdminPanel() {
         </div>
       )}
 
-      {activeTab === 'scratch-pull' && (
+      {activeTab === 'bonuses' && (
         <div className="animate-in fade-in duration-500">
-          <ScratchAndPullTabsAdmin />
+          <BonusManager />
         </div>
       )}
 
-      {activeTab === 'scratch-pull' && (
+      {activeTab === 'community-moderation' && (
         <div className="animate-in fade-in duration-500">
-          <ScratchAndPullTabsAdmin />
+          <CommunityManager />
         </div>
       )}
 
@@ -1036,6 +1058,14 @@ export default function AdminPanel() {
                           onBlur={(e) => updateSettingsMutation.mutate({ min_redemption_sc: e.target.value })}
                         />
                       </div>
+                      <div>
+                        <label className="text-xs font-bold text-slate-500 uppercase">Redemption Fee ($)</label>
+                        <input 
+                          className="w-full bg-slate-950 border border-white/10 rounded-lg px-4 py-2 text-white"
+                          defaultValue={settings?.redemption_fee}
+                          onBlur={(e) => updateSettingsMutation.mutate({ redemption_fee: e.target.value })}
+                        />
+                      </div>
                       <div className="flex items-center justify-between p-3 bg-slate-950 rounded-xl border border-white/5">
                         <span className="text-sm text-slate-300">Enable Facebook Share</span>
                         <input type="checkbox" defaultChecked={settings?.enable_social_facebook === 'true'} onChange={(e) => updateSettingsMutation.mutate({ enable_social_facebook: e.target.checked.toString() })} />
@@ -1048,32 +1078,31 @@ export default function AdminPanel() {
                   </div>
                 </div>
                 
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <label className="text-xs font-bold text-slate-500 uppercase">Redemption Fee ($)</label>
-                    <input 
-                      name="redemption_fee" 
-                      type="number"
-                      defaultValue={settings.redemption_fee} 
-                      className="w-full bg-slate-950 border border-white/10 rounded-lg px-4 py-2 text-white"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <label className="text-xs font-bold text-slate-500 uppercase">Min Redemption (SC)</label>
-                    <input 
-                      name="min_redemption_sc" 
-                      type="number"
-                      defaultValue={settings.min_redemption_sc} 
-                      className="w-full bg-slate-950 border border-white/10 rounded-lg px-4 py-2 text-white"
-                    />
-                  </div>
-                </div>
-
                 <Button type="submit" className="w-full gap-2" disabled={updateSettingsMutation.isPending}>
                   <Save className="w-4 h-4" /> Save Settings
                 </Button>
               </form>
             )}
+          </CardContent>
+        </Card>
+      )}
+      {activeTab === 'help' && (
+        <Card className="animate-in fade-in duration-500">
+          <CardHeader>
+            <h3 className="font-bold text-white">Help & Documentation</h3>
+          </CardHeader>
+          <CardContent className="prose prose-invert max-w-none">
+            <h4 id="ai-features">AI Features</h4>
+            <p>Our platform is powered by advanced AI employees that handle various aspects of the site:</p>
+            <ul>
+              <li><strong>DevAi:</strong> Lead Game Developer. Can build new games from scratch or rebrand existing URLs. Handles the daily new games pipeline.</li>
+              <li><strong>SocialAi:</strong> Marketing Manager. Generates social media campaigns, promotional emails, SMS, and player retention messages.</li>
+              <li><strong>SecurityAi:</strong> Monitors site safety and detects anomalies.</li>
+              <li><strong>PlayersAi:</strong> Assists with KYC and player support.</li>
+              <li><strong>AdminAi:</strong> General assistant for site management.</li>
+            </ul>
+            <h4>AI Game Builder</h4>
+            <p>Open the AI Game Builder to create new games or rebrand existing ones. You can chat naturally with DevAi to describe the game you want.</p>
           </CardContent>
         </Card>
       )}

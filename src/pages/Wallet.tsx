@@ -193,7 +193,7 @@ export default function Wallet() {
                       value={redemptionAmount}
                       onChange={(e) => setRedemptionAmount(e.target.value)}
                       className="w-full bg-slate-950 border border-white/10 rounded-lg px-4 py-2 text-white"
-                      placeholder="Min 100 SC"
+                      placeholder="Min 50 SC"
                     />
                   </div>
                   <div className="space-y-2">
@@ -211,7 +211,7 @@ export default function Wallet() {
                   <Button variant="ghost" onClick={() => setIsRedeeming(false)}>Cancel</Button>
                   <Button 
                     onClick={() => redeemMutation.mutate()}
-                    disabled={redeemMutation.isPending || !redemptionAmount || parseFloat(redemptionAmount) < 100}
+                    disabled={redeemMutation.isPending || !redemptionAmount || parseFloat(redemptionAmount) < 50}
                     className="bg-emerald-600 hover:bg-emerald-700 text-white"
                   >
                     {redeemMutation.isPending ? 'Submitting...' : 'Request Payout'}
@@ -357,21 +357,11 @@ export default function Wallet() {
                       <td className="px-6 py-4 text-sm text-slate-300">{tx.description}</td>
                       <td className="px-6 py-4 text-right">
                         <div className="flex flex-col items-end">
-                          {tx.gc_amount !== 0 && (
-                            <span className={cn(
-                              "text-xs font-bold",
-                              tx.gc_amount > 0 ? "text-yellow-500" : "text-red-500"
-                            )}>
-                              {tx.gc_amount > 0 ? '+' : ''}{tx.gc_amount.toLocaleString()} GC
-                            </span>
+                          {tx.gc_amount > 0 && (
+                            <span className="text-xs font-bold text-yellow-500">+{tx.gc_amount.toLocaleString()} GC</span>
                           )}
-                          {tx.sc_amount !== 0 && (
-                            <span className={cn(
-                              "text-xs font-bold",
-                              tx.sc_amount > 0 ? "text-emerald-500" : "text-red-500"
-                            )}>
-                              {tx.sc_amount > 0 ? '+' : ''}{tx.sc_amount.toFixed(2)} SC
-                            </span>
+                          {tx.sc_amount > 0 && (
+                            <span className="text-xs font-bold text-emerald-500">+{tx.sc_amount.toFixed(2)} SC</span>
                           )}
                         </div>
                       </td>

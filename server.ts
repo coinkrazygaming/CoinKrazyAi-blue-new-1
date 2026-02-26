@@ -13,6 +13,9 @@ import { GoogleGenAI } from "@google/genai";
 dotenv.config();
 
 const app = express();
+app.use(express.json());
+app.use(cookieParser());
+
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
@@ -23,6 +26,477 @@ const io = new Server(httpServer, {
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'coinkrazy-secret-key-123';
+const PORT = 3000;
+
+// Database Setup
+const db = new Database('coinkrazy.db');
+db.pragma('journal_mode = WAL');
+
+// Initialize Schema
+db.exec(`
+  CREATE TABLE IF NOT EXISTS players (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    avatar_url TEXT,
+    gc_balance REAL DEFAULT 1000,
+    sc_balance REAL DEFAULT 0,
+    total_wagered REAL DEFAULT 0,
+    vip_status TEXT DEFAULT 'Bronze',
+    kyc_verified INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'Active',
+    role TEXT DEFAULT 'player',
+    referred_by INTEGER,
+    last_login DATETIME DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    kyc_status TEXT DEFAULT 'unverified'
+  );
+
+  CREATE TABLE IF NOT EXISTS games (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL, -- slots, crash, scratch, pulltab
+    description TEXT,
+    thumbnail_url TEXT,
+    enabled INTEGER DEFAULT 1,
+    rtp REAL DEFAULT 95.0,
+    min_bet REAL DEFAULT 0.1,
+    max_bet REAL DEFAULT 100.0,
+    is_featured INTEGER DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS admin_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL, -- 'ai_task', 'kyc_submission', 'redemption_request', 'game_ready', 'social_campaign'
+    source_id INTEGER, -- ID of the related record
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    status TEXT DEFAULT 'pending', -- pending, approved, denied, actioned
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS kyc_documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL,
+    document_type TEXT NOT NULL,
+    document_url TEXT NOT NULL,
+    status TEXT DEFAULT 'pending',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(player_id) REFERENCES players(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS game_builder_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id INTEGER NOT NULL,
+    game_id INTEGER,
+    name TEXT,
+    config TEXT,
+    history TEXT,
+    status TEXT DEFAULT 'active',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(admin_id) REFERENCES players(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS social_campaigns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL, -- 'social_media', 'email', 'sms', 'retention'
+    platform TEXT,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    status TEXT DEFAULT 'pending',
+    scheduled_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS ai_employees (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL,
+    description TEXT,
+    avatar_url TEXT,
+    status TEXT DEFAULT 'online',
+    current_task TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS ai_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    employee_id INTEGER NOT NULL,
+    type TEXT NOT NULL, -- task, report, alert, review
+    content TEXT NOT NULL,
+    status TEXT DEFAULT 'pending', -- pending, approved, denied
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(employee_id) REFERENCES ai_employees(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS ai_chats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    employee_id INTEGER NOT NULL,
+    sender TEXT NOT NULL, -- admin, ai
+    message TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(employee_id) REFERENCES ai_employees(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS coin_packages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    gc_amount REAL NOT NULL,
+    sc_amount REAL NOT NULL,
+    price REAL NOT NULL,
+    image_url TEXT,
+    is_featured INTEGER DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS site_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS wallet_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL,
+    type TEXT NOT NULL, -- deposit, withdrawal, bet, win, bonus, admin_adjustment, ticket_purchase, ticket_win
+    gc_amount REAL DEFAULT 0,
+    sc_amount REAL DEFAULT 0,
+    description TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(player_id) REFERENCES players(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS game_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL,
+    game_id INTEGER NOT NULL,
+    bet_amount REAL NOT NULL,
+    win_amount REAL NOT NULL,
+    currency TEXT NOT NULL,
+    multiplier REAL,
+    details TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(player_id) REFERENCES players(id),
+    FOREIGN KEY(game_id) REFERENCES games(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS ticket_types (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL, -- scratch, pulltab
+    price_sc REAL NOT NULL,
+    top_prize_sc REAL NOT NULL,
+    total_tickets INTEGER NOT NULL,
+    remaining_tickets INTEGER NOT NULL,
+    odds_description TEXT,
+    theme_images TEXT, -- JSON array of image URLs
+    is_active INTEGER DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS ticket_purchases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL,
+    ticket_type_id INTEGER NOT NULL,
+    status TEXT DEFAULT 'purchased', -- purchased, revealed, claimed, saved
+    is_win INTEGER DEFAULT 0,
+    win_amount REAL DEFAULT 0,
+    reveal_data TEXT, -- JSON of what was revealed
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(player_id) REFERENCES players(id),
+    FOREIGN KEY(ticket_type_id) REFERENCES ticket_types(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS user_saved_wins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL,
+    purchase_id INTEGER NOT NULL,
+    ticket_name TEXT NOT NULL,
+    amount_won REAL NOT NULL,
+    image_url TEXT,
+    claimed INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(player_id) REFERENCES players(id),
+    FOREIGN KEY(purchase_id) REFERENCES ticket_purchases(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS friendships (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    friend_id INTEGER NOT NULL,
+    status TEXT DEFAULT 'pending', -- pending, accepted, blocked
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES players(id),
+    FOREIGN KEY(friend_id) REFERENCES players(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS social_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    platform_username TEXT,
+    access_token TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(player_id) REFERENCES players(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS activity_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    action TEXT NOT NULL,
+    details TEXT,
+    ip_address TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES players(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS tournaments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    game_slug TEXT NOT NULL,
+    start_time DATETIME NOT NULL,
+    end_time DATETIME NOT NULL,
+    entry_fee REAL DEFAULT 0,
+    prize_pool REAL NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'gc',
+    status TEXT DEFAULT 'upcoming', -- upcoming, active, completed
+    scoring_type TEXT DEFAULT 'highest_win_multiplier', -- highest_win_multiplier, total_wagered, total_wins
+    max_participants INTEGER DEFAULT 100,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS tournament_participants (
+    tournament_id INTEGER NOT NULL,
+    player_id INTEGER NOT NULL,
+    score REAL DEFAULT 0,
+    rank INTEGER,
+    joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(tournament_id, player_id),
+    FOREIGN KEY(tournament_id) REFERENCES tournaments(id),
+    FOREIGN KEY(player_id) REFERENCES players(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS redemptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL,
+    amount_sc REAL NOT NULL,
+    method TEXT NOT NULL,
+    details TEXT,
+    status TEXT DEFAULT 'pending', -- pending, approved, rejected, paid
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    processed_at DATETIME,
+    FOREIGN KEY(player_id) REFERENCES players(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_slug TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    message TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES players(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS achievements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    icon TEXT,
+    requirement_type TEXT NOT NULL,
+    requirement_value REAL NOT NULL,
+    reward_gc REAL DEFAULT 0,
+    reward_sc REAL DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS player_achievements (
+    player_id INTEGER NOT NULL,
+    achievement_id INTEGER NOT NULL,
+    unlocked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(player_id, achievement_id),
+    FOREIGN KEY(player_id) REFERENCES players(id),
+    FOREIGN KEY(achievement_id) REFERENCES achievements(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS bonuses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL, -- 'deposit_match', 'free_spins', 'cashback', 'loyalty'
+    description TEXT,
+    code TEXT UNIQUE,
+    reward_gc REAL DEFAULT 0,
+    reward_sc REAL DEFAULT 0,
+    min_deposit REAL DEFAULT 0,
+    wagering_requirement REAL DEFAULT 0, -- multiplier of bonus amount
+    game_eligibility TEXT, -- JSON array of game slugs or 'all'
+    max_win REAL,
+    expiration_days INTEGER,
+    status TEXT DEFAULT 'active', -- active, paused, deleted
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS player_bonuses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL,
+    bonus_id INTEGER NOT NULL,
+    status TEXT DEFAULT 'active', -- active, completed, expired, cancelled
+    wagering_progress REAL DEFAULT 0,
+    wagering_target REAL NOT NULL,
+    expires_at DATETIME,
+    claimed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME,
+    FOREIGN KEY(player_id) REFERENCES players(id),
+    FOREIGN KEY(bonus_id) REFERENCES bonuses(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS forum_boards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT,
+    slug TEXT UNIQUE NOT NULL,
+    display_order INTEGER DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS forum_topics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    board_id INTEGER NOT NULL,
+    author_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    is_pinned INTEGER DEFAULT 0,
+    is_locked INTEGER DEFAULT 0,
+    views INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(board_id) REFERENCES forum_boards(id),
+    FOREIGN KEY(author_id) REFERENCES players(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS forum_posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic_id INTEGER NOT NULL,
+    author_id INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    parent_id INTEGER, -- For threaded replies
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(topic_id) REFERENCES forum_topics(id),
+    FOREIGN KEY(author_id) REFERENCES players(id),
+    FOREIGN KEY(parent_id) REFERENCES forum_posts(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS forum_likes (
+    post_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(post_id, user_id),
+    FOREIGN KEY(post_id) REFERENCES forum_posts(id),
+    FOREIGN KEY(user_id) REFERENCES players(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS global_chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    message TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES players(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS community_moderation_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    action TEXT NOT NULL, -- 'warning', 'mute', 'kick', 'ban'
+    reason TEXT,
+    duration_minutes INTEGER,
+    moderator_id TEXT DEFAULT 'SecurityAi',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES players(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS player_community_status (
+    player_id INTEGER PRIMARY KEY,
+    offense_count INTEGER DEFAULT 0,
+    mute_until DATETIME,
+    is_banned INTEGER DEFAULT 0,
+    FOREIGN KEY(player_id) REFERENCES players(id)
+  );
+`);
+
+// Initialize Settings
+const initSettings = () => {
+  const defaultSettings = {
+    'site_name': 'CoinKrazy AI',
+    'maintenance_mode': 'false',
+    'signup_bonus_gc': '10000',
+    'signup_bonus_sc': '5',
+    'referral_bonus_gc': '1000',
+    'referral_bonus_sc': '1',
+    'enable_cashapp': 'true',
+    'enable_googlepay': 'true',
+    'redemption_fee': '5',
+    'min_redemption_sc': '100',
+    'social_share_template': 'Just won {amount} SC on PlayCoinKrazy.com playing {ticket}! 🔥 Come play with me and use my referral code {code} for 1000 GC + 1 SC bonus when you sign up! → https://playcoinkrazy.com/register?ref={code}',
+    'enable_social_facebook': 'true',
+    'enable_social_twitter': 'true',
+    'enable_social_instagram': 'true',
+    'enable_social_tiktok': 'true',
+  };
+  
+  const insert = db.prepare('INSERT OR IGNORE INTO site_settings (key, value) VALUES (?, ?)');
+  Object.entries(defaultSettings).forEach(([k, v]) => insert.run(k, v));
+};
+
+// Seed Coin Packages
+const seedPackages = () => {
+  const packages = [
+    { name: 'Starter Pack', gc_amount: 10000, sc_amount: 5, price: 4.99, image_url: 'https://picsum.photos/seed/starter/200/200', is_featured: 0 },
+    { name: 'Pro Pack', gc_amount: 50000, sc_amount: 25, price: 19.99, image_url: 'https://picsum.photos/seed/pro/200/200', is_featured: 1 },
+    { name: 'Whale Pack', gc_amount: 250000, sc_amount: 125, price: 99.99, image_url: 'https://picsum.photos/seed/whale/200/200', is_featured: 0 },
+  ];
+  
+  const insert = db.prepare('INSERT OR IGNORE INTO coin_packages (name, gc_amount, sc_amount, price, image_url, is_featured) VALUES (?, ?, ?, ?, ?, ?)');
+  packages.forEach(p => insert.run(p.name, p.gc_amount, p.sc_amount, p.price, p.image_url, p.is_featured));
+};
+
+// Seed AI Employees
+const seedAiEmployees = () => {
+  const employees = [
+    { name: 'DevAi', role: 'Lead Game Developer', description: 'Master of game mechanics, rebranding, and automated game pipelines.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=DevAi' },
+    { name: 'SocialAi', role: 'Social Media & Marketing Manager', description: 'Handles social media, email campaigns, SMS, and player retention.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=SocialAi' },
+    { name: 'SecurityAi', role: 'Site Security', description: 'Monitors site safety, detects anomalies, and ensures player protection.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=SecurityAi' },
+    { name: 'PlayersAi', role: 'Player Support', description: 'Assists with KYC verification, player inquiries, and support tickets.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=PlayersAi' },
+    { name: 'AdminAi', role: 'Admin Assistant', description: 'Suggests site updates, manages settings, and compiles reports.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=AdminAi' },
+  ];
+
+  const insert = db.prepare('INSERT OR IGNORE INTO ai_employees (name, role, description, avatar_url) VALUES (?, ?, ?, ?)');
+  const check = db.prepare('SELECT id FROM ai_employees WHERE name = ?');
+  
+  employees.forEach(e => {
+    if (!check.get(e.name)) {
+      insert.run(e.name, e.role, e.description, e.avatar_url);
+    }
+  });
+};
+
+initSettings();
+seedPackages();
+seedAiEmployees();
+
+const seedForumBoards = () => {
+  const boards = [
+    { name: 'General Discussion', description: 'Talk about anything platform related.', slug: 'general', display_order: 1 },
+    { name: 'Game Discussions', description: 'Strategies, tips, and talk about your favorite games.', slug: 'games', display_order: 2 },
+    { name: 'Wins & Losses', description: 'Share your big wins and epic losses.', slug: 'wins-losses', display_order: 3 },
+    { name: 'Suggestions', description: 'Help us improve PlayCoinKrazy.com.', slug: 'suggestions', display_order: 4 },
+    { name: 'Off-Topic', description: 'Anything else on your mind.', slug: 'off-topic', display_order: 5 },
+  ];
+
+  const insert = db.prepare('INSERT OR IGNORE INTO forum_boards (name, description, slug, display_order) VALUES (?, ?, ?, ?)');
+  boards.forEach(b => insert.run(b.name, b.description, b.slug, b.display_order));
+};
+
+seedForumBoards();
 
 // Middleware to verify JWT
 const authenticate = (req: any, res: any, next: any) => {
@@ -86,6 +560,204 @@ app.post('/api/admin/settings', authenticate, isAdmin, (req: any, res) => {
   }
 });
 
+// Admin Notifications
+app.get('/api/admin/notifications', authenticate, isAdmin, (req: any, res) => {
+  try {
+    const notifications = db.prepare('SELECT * FROM admin_notifications ORDER BY created_at DESC').all();
+    res.json({ notifications });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/notifications/:id/action', authenticate, isAdmin, (req: any, res) => {
+  const { id } = req.params;
+  const { status } = req.body; // approved, denied, actioned
+  try {
+    db.prepare('UPDATE admin_notifications SET status = ? WHERE id = ?').run(status, id);
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Manage Games
+app.get('/api/admin/games', authenticate, isAdmin, (req: any, res) => {
+  try {
+    const games = db.prepare('SELECT * FROM games ORDER BY name ASC').all();
+    res.json({ games });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/admin/games/:id', authenticate, isAdmin, (req: any, res) => {
+  const { id } = req.params;
+  const { enabled, name, description, rtp, min_bet, max_bet } = req.body;
+  try {
+    const updates: string[] = [];
+    const values: any[] = [];
+    
+    if (enabled !== undefined) { updates.push('enabled = ?'); values.push(enabled ? 1 : 0); }
+    if (name !== undefined) { updates.push('name = ?'); values.push(name); }
+    if (description !== undefined) { updates.push('description = ?'); values.push(description); }
+    if (rtp !== undefined) { updates.push('rtp = ?'); values.push(rtp); }
+    if (min_bet !== undefined) { updates.push('min_bet = ?'); values.push(min_bet); }
+    if (max_bet !== undefined) { updates.push('max_bet = ?'); values.push(max_bet); }
+    
+    if (updates.length > 0) {
+      values.push(id);
+      db.prepare(`UPDATE games SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+    }
+    
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/admin/games/:id', authenticate, isAdmin, (req: any, res) => {
+  const { id } = req.params;
+  try {
+    db.prepare('DELETE FROM games WHERE id = ?').run(id);
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// AI Game Builder
+app.post('/api/admin/ai/game-builder/chat', authenticate, isAdmin, async (req: any, res) => {
+  const { message, sessionId, gameId } = req.body;
+  
+  try {
+    let session;
+    if (sessionId) {
+      session = db.prepare('SELECT * FROM game_builder_sessions WHERE id = ?').get(sessionId) as any;
+    } else {
+      const result = db.prepare('INSERT INTO game_builder_sessions (admin_id, game_id, history) VALUES (?, ?, ?)')
+        .run(req.user.id, gameId || null, JSON.stringify([]));
+      session = { id: result.lastInsertRowid, history: '[]' };
+    }
+
+    const history = JSON.parse(session.history || '[]');
+    history.push({ role: 'user', content: message, timestamp: new Date().toISOString() });
+
+    const prompt = `You are DevAi, the Lead Game Developer for PlayCoinKrazy.com. 
+    You are using the AI Game Builder tool to help the admin create or rebrand a game.
+    
+    CRITICAL RULES:
+    1. Every game MUST be branded "PlayCoinKrazy.com" and "Coin Krazy Studios".
+    2. Suggest 3-5 creative variations before starting any new build.
+    3. If a URL is provided, simulate crawling it and extracting theme, art, mechanics, etc.
+    4. Always replace original branding with Coin Krazy Studios.
+    5. Provide structured JSON in your response for "preview_data" if you are showing a step (concept, theme, mechanics, art, UI, bonuses, thumbnail, final).
+    
+    Session History: ${JSON.stringify(history.slice(-5))}
+    Admin Message: "${message}"
+    
+    Respond in character as DevAi. If you are starting a build, suggest variations. If you are in the middle of a build, show the next step's preview data.`;
+
+    const aiResponse = await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'OBJECT',
+          properties: {
+            text: { type: 'STRING' },
+            preview_data: { 
+              type: 'OBJECT',
+              properties: {
+                step: { type: 'STRING' }, // concept, theme, mechanics, art, ui, bonuses, thumbnail, final
+                title: { type: 'STRING' },
+                description: { type: 'STRING' },
+                image_url: { type: 'STRING' },
+                config: { type: 'OBJECT' }
+              }
+            },
+            variations: {
+              type: 'ARRAY',
+              items: { type: 'STRING' }
+            }
+          }
+        }
+      }
+    });
+
+    const responseData = JSON.parse(aiResponse.text || '{}');
+    history.push({ role: 'ai', content: responseData.text, preview: responseData.preview_data, timestamp: new Date().toISOString() });
+
+    db.prepare('UPDATE game_builder_sessions SET history = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .run(JSON.stringify(history), session.id);
+
+    res.json({ 
+      success: true, 
+      sessionId: session.id,
+      ...responseData
+    });
+  } catch (error: any) {
+    console.error('Game Builder Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Social Campaigns
+app.get('/api/admin/social/campaigns', authenticate, isAdmin, (req: any, res) => {
+  try {
+    const campaigns = db.prepare('SELECT * FROM social_campaigns ORDER BY created_at DESC').all();
+    res.json({ campaigns });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/social/generate', authenticate, isAdmin, async (req: any, res) => {
+  const { type, prompt: userPrompt } = req.body; // social_media, email, sms, retention
+  
+  try {
+    const prompt = `You are SocialAi, the Marketing Manager for PlayCoinKrazy.com.
+    Generate a ${type} campaign based on: "${userPrompt || 'General promotion'}".
+    
+    Requirements:
+    - For social_media: Generate posts for Twitter and Instagram (captions, hashtags, image descriptions).
+    - For email: Generate a subject line and HTML body.
+    - For sms: Generate a short text message.
+    - For retention: Include a personalized incentive (e.g. "Use code BACK25 for 25 free spins").
+    
+    Respond with JSON.`;
+
+    const aiResponse = await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'OBJECT',
+          properties: {
+            title: { type: 'STRING' },
+            content: { type: 'OBJECT' }
+          }
+        }
+      }
+    });
+
+    const responseData = JSON.parse(aiResponse.text || '{}');
+    
+    const result = db.prepare('INSERT INTO social_campaigns (type, title, content, status) VALUES (?, ?, ?, ?)')
+      .run(type, responseData.title, JSON.stringify(responseData.content), 'pending');
+
+    // Also add to admin notifications
+    db.prepare('INSERT INTO admin_notifications (type, source_id, title, content) VALUES (?, ?, ?, ?)')
+      .run('social_campaign', result.lastInsertRowid, `New ${type} Campaign: ${responseData.title}`, `SocialAi has generated a new ${type} campaign for review.`);
+
+    res.json({ success: true, campaignId: result.lastInsertRowid, ...responseData });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Ticker Endpoint
 app.get('/api/ticker', (req, res) => {
   try {
@@ -127,348 +799,74 @@ app.get('/api/ticker', (req, res) => {
   }
 });
 
-const PORT = 3000;
+// SecurityAi Moderation Logic
+const moderateContent = async (userId: number, content: string, type: 'chat' | 'forum') => {
+  try {
+    const prompt = `You are SecurityAi, the site moderator for PlayCoinKrazy.com. 
+    Analyze the following ${type} content for swearing, slurs, advertisement links, spam, or off-topic promotions.
+    Content: "${content}"
+    
+    If the content is safe, respond with "SAFE".
+    If the content violates rules, respond with "VIOLATION: [Reason]".
+    Be strict. Zero tolerance.`;
 
-// Database Setup
-const db = new Database('coinkrazy.db');
-db.pragma('journal_mode = WAL');
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: prompt
+    });
 
-// Initialize Schema
-db.exec(`
-  CREATE TABLE IF NOT EXISTS players (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT UNIQUE NOT NULL,
-    username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    avatar_url TEXT,
-    gc_balance REAL DEFAULT 1000,
-    sc_balance REAL DEFAULT 0,
-    total_wagered REAL DEFAULT 0,
-    vip_status TEXT DEFAULT 'Bronze',
-    kyc_verified INTEGER DEFAULT 0,
-    status TEXT DEFAULT 'Active',
-    last_login DATETIME,
-    last_bonus_claim DATETIME,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+    const result = response.text?.trim() || "SAFE";
+    
+    if (result.startsWith("VIOLATION")) {
+      const reason = result.replace("VIOLATION:", "").trim();
+      
+      // Get current status
+      let status = db.prepare('SELECT * FROM player_community_status WHERE player_id = ?').get(userId) as any;
+      if (!status) {
+        db.prepare('INSERT INTO player_community_status (player_id) VALUES (?)').run(userId);
+        status = { player_id: userId, offense_count: 0, is_banned: 0 };
+      }
 
-  CREATE TABLE IF NOT EXISTS games (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    type TEXT NOT NULL,
-    slug TEXT UNIQUE NOT NULL,
-    description TEXT,
-    rtp REAL DEFAULT 96.0,
-    min_bet REAL DEFAULT 1,
-    max_bet REAL DEFAULT 1000,
-    enabled INTEGER DEFAULT 1,
-    image_url TEXT
-  );
+      const newOffenseCount = status.offense_count + 1;
+      let action = 'warning';
+      let duration = 0;
+      let muteUntil = null;
+      let isBanned = 0;
 
-  CREATE TABLE IF NOT EXISTS wallet_transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    type TEXT NOT NULL,
-    gc_amount REAL DEFAULT 0,
-    sc_amount REAL DEFAULT 0,
-    description TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(player_id) REFERENCES players(id)
-  );
+      if (newOffenseCount === 1) {
+        action = 'mute';
+        duration = 5;
+        muteUntil = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+      } else if (newOffenseCount === 2) {
+        action = 'kick';
+        duration = 60;
+        muteUntil = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      } else if (newOffenseCount >= 3) {
+        action = 'ban';
+        isBanned = 1;
+      }
 
-  CREATE TABLE IF NOT EXISTS game_results (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    game_id INTEGER NOT NULL,
-    bet_amount REAL NOT NULL,
-    win_amount REAL NOT NULL,
-    currency TEXT NOT NULL,
-    multiplier REAL,
-    result_data TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(player_id) REFERENCES players(id),
-    FOREIGN KEY(game_id) REFERENCES games(id)
-  );
+      // Update status
+      db.prepare('UPDATE player_community_status SET offense_count = ?, mute_until = ?, is_banned = ? WHERE player_id = ?')
+        .run(newOffenseCount, muteUntil, isBanned, userId);
 
-  CREATE TABLE IF NOT EXISTS achievements (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    description TEXT,
-    icon TEXT,
-    requirement_type TEXT,
-    requirement_value REAL
-  );
+      // Log action
+      db.prepare('INSERT INTO community_moderation_logs (user_id, action, reason, duration_minutes) VALUES (?, ?, ?, ?)')
+        .run(userId, action, reason, duration);
 
-  CREATE TABLE IF NOT EXISTS player_achievements (
-    player_id INTEGER NOT NULL,
-    achievement_id INTEGER NOT NULL,
-    unlocked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY(player_id, achievement_id),
-    FOREIGN KEY(player_id) REFERENCES players(id),
-    FOREIGN KEY(achievement_id) REFERENCES achievements(id)
-  );
+      // Add notification for admin
+      db.prepare('INSERT INTO admin_notifications (type, title, content) VALUES (?, ?, ?)')
+        .run('ai_task', `SecurityAi: ${action.toUpperCase()} issued to user #${userId}`, `Reason: ${reason}. Offense #${newOffenseCount}`);
 
-  CREATE TABLE IF NOT EXISTS friendships (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    friend_id INTEGER NOT NULL,
-    status TEXT DEFAULT 'pending', -- pending, accepted, blocked
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(user_id) REFERENCES players(id),
-    FOREIGN KEY(friend_id) REFERENCES players(id),
-    UNIQUE(user_id, friend_id)
-  );
-
-  CREATE TABLE IF NOT EXISTS site_settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS chat_messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    game_slug TEXT NOT NULL,
-    user_id INTEGER NOT NULL,
-    message TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(user_id) REFERENCES players(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS tournaments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    game_slug TEXT NOT NULL,
-    start_time DATETIME NOT NULL,
-    end_time DATETIME NOT NULL,
-    entry_fee REAL DEFAULT 0,
-    prize_pool REAL NOT NULL,
-    currency TEXT NOT NULL DEFAULT 'gc',
-    status TEXT DEFAULT 'upcoming', -- upcoming, active, completed
-    scoring_type TEXT DEFAULT 'highest_win_multiplier', -- highest_win_multiplier, total_wagered, total_wins
-    max_participants INTEGER DEFAULT 100,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS tournament_participants (
-    tournament_id INTEGER NOT NULL,
-    player_id INTEGER NOT NULL,
-    score REAL DEFAULT 0,
-    rank INTEGER,
-    joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY(tournament_id, player_id),
-    FOREIGN KEY(tournament_id) REFERENCES tournaments(id),
-    FOREIGN KEY(player_id) REFERENCES players(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS redemption_requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    amount_sc REAL NOT NULL,
-    payout_amount REAL NOT NULL,
-    payment_method TEXT NOT NULL, -- 'cashapp'
-    payment_details TEXT NOT NULL, -- cashapp tag
-    status TEXT DEFAULT 'pending', -- pending, approved, paid, rejected
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    processed_at DATETIME,
-    FOREIGN KEY(player_id) REFERENCES players(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS coin_packages (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    gc_amount REAL NOT NULL,
-    sc_amount REAL NOT NULL,
-    price REAL NOT NULL,
-    image_url TEXT,
-    is_featured INTEGER DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS ai_employees (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    role TEXT NOT NULL,
-    description TEXT,
-    status TEXT DEFAULT 'active', -- active, idle, maintenance
-    current_task TEXT,
-    avatar_url TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS ai_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    employee_id INTEGER NOT NULL,
-    type TEXT NOT NULL, -- review, suggestion, alert, task_update
-    content TEXT NOT NULL,
-    status TEXT DEFAULT 'pending', -- pending, approved, denied, read
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(employee_id) REFERENCES ai_employees(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS ai_chats (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    employee_id INTEGER NOT NULL,
-    sender TEXT NOT NULL, -- admin, ai
-    message TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(employee_id) REFERENCES ai_employees(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS ticket_types (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT NOT NULL, -- 'scratch' or 'pulltab'
-    name TEXT NOT NULL,
-    description TEXT,
-    price_sc REAL NOT NULL,
-    win_probability REAL DEFAULT 0.142857, -- 1/7
-    min_prize REAL DEFAULT 0.01,
-    max_prize REAL DEFAULT 10.00,
-    theme_images TEXT, -- JSON array of image URLs
-    color_scheme TEXT,
-    is_active INTEGER DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS ticket_purchases (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    ticket_type_id INTEGER NOT NULL,
-    cost_sc REAL NOT NULL,
-    win_amount REAL DEFAULT 0,
-    is_win INTEGER DEFAULT 0,
-    result_data TEXT, -- JSON details of the reveal
-    status TEXT DEFAULT 'purchased', -- purchased, revealed, claimed, saved
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(player_id) REFERENCES players(id),
-    FOREIGN KEY(ticket_type_id) REFERENCES ticket_types(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS user_saved_wins (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    purchase_id INTEGER NOT NULL,
-    ticket_name TEXT NOT NULL,
-    amount_won REAL NOT NULL,
-    image_url TEXT,
-    claimed INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(player_id) REFERENCES players(id),
-    FOREIGN KEY(purchase_id) REFERENCES ticket_purchases(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS social_links (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    platform TEXT NOT NULL, -- 'facebook', 'twitter', 'instagram', 'tiktok'
-    platform_user_id TEXT,
-    platform_username TEXT,
-    access_token TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(player_id, platform),
-    FOREIGN KEY(player_id) REFERENCES players(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS activity_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER,
-    action TEXT NOT NULL,
-    details TEXT,
-    ip_address TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS pending_wins (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    game_slug TEXT NOT NULL,
-    amount REAL NOT NULL,
-    result_data TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(player_id) REFERENCES players(id)
-  );
-`);
-
-// Migration for existing DB
-try {
-  db.prepare("ALTER TABLE players ADD COLUMN role TEXT DEFAULT 'user'").run();
-} catch (e) {}
-try {
-  db.prepare("ALTER TABLE players ADD COLUMN referral_code TEXT UNIQUE").run();
-} catch (e) {}
-try {
-  db.prepare("ALTER TABLE players ADD COLUMN referred_by INTEGER").run();
-} catch (e) {}
-try {
-  db.prepare("ALTER TABLE players ADD COLUMN kyc_status TEXT DEFAULT 'unverified'").run(); // unverified, pending, verified
-} catch (e) {}
-try {
-  db.prepare("ALTER TABLE players ADD COLUMN cashapp_tag TEXT").run();
-} catch (e) {}
-
-// Initialize Settings
-const initSettings = () => {
-  const defaultSettings = {
-    'site_name': 'CoinKrazy AI',
-    'maintenance_mode': 'false',
-    'signup_bonus_gc': '10000',
-    'signup_bonus_sc': '5',
-    'referral_bonus_gc': '1000',
-    'referral_bonus_sc': '1',
-    'enable_cashapp': 'true',
-    'enable_googlepay': 'true',
-    'redemption_fee': '5',
-    'min_redemption_sc': '100',
-    'social_share_template': 'Just won {amount} SC on PlayCoinKrazy.com playing {ticket}! 🔥 Come play with me and use my referral code {code} for 1000 GC + 1 SC bonus when you sign up! → https://playcoinkrazy.com/register?ref={code}',
-    'enable_social_facebook': 'true',
-    'enable_social_twitter': 'true',
-    'enable_social_instagram': 'true',
-    'enable_social_tiktok': 'true',
-  };
-  
-  const insert = db.prepare('INSERT OR IGNORE INTO site_settings (key, value) VALUES (?, ?)');
-  Object.entries(defaultSettings).forEach(([k, v]) => insert.run(k, v));
-};
-
-// Seed Coin Packages
-const seedPackages = () => {
-  const packages = [
-    { id: 'starter', name: 'Starter Pack', gc_amount: 10000, sc_amount: 5, price: 4.99, image_url: 'https://picsum.photos/seed/starter/200/200', is_featured: 0 },
-    { id: 'pro', name: 'Pro Pack', gc_amount: 50000, sc_amount: 25, price: 19.99, image_url: 'https://picsum.photos/seed/pro/200/200', is_featured: 1 },
-    { id: 'whale', name: 'Whale Pack', gc_amount: 250000, sc_amount: 125, price: 99.99, image_url: 'https://picsum.photos/seed/whale/200/200', is_featured: 0 },
-  ];
-  
-  const insert = db.prepare('INSERT OR IGNORE INTO coin_packages (id, name, gc_amount, sc_amount, price, image_url, is_featured) VALUES (?, ?, ?, ?, ?, ?, ?)');
-  packages.forEach(p => insert.run(p.id, p.name, p.gc_amount, p.sc_amount, p.price, p.image_url, p.is_featured));
-};
-
-seedPackages();
-
-// Seed AI Employees
-const seedAiEmployees = () => {
-  const employees = [
-    { name: 'DevAi', role: 'Game Editor & Builder', description: 'Helps build and edit games, fix bugs, and optimize performance.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=DevAi' },
-    { name: 'SecurityAi', role: 'Site Security', description: 'Monitors site safety, detects anomalies, and ensures player protection.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=SecurityAi' },
-    { name: 'PlayersAi', role: 'Player Support', description: 'Assists with KYC verification, player inquiries, and support tickets.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=PlayersAi' },
-    { name: 'AdminAi', role: 'Admin Assistant', description: 'Suggests site updates, manages settings, and compiles reports.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=AdminAi' },
-    { name: 'SlotsAi', role: 'Slots Monitor', description: 'Monitors slots for cheating, verifies RTP, and checks for errors.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=SlotsAi' },
-  ];
-
-  const insert = db.prepare('INSERT OR IGNORE INTO ai_employees (name, role, description, avatar_url) VALUES (?, ?, ?, ?)');
-  const check = db.prepare('SELECT id FROM ai_employees WHERE name = ?');
-  
-  employees.forEach(e => {
-    if (!check.get(e.name)) {
-      insert.run(e.name, e.role, e.description, e.avatar_url);
+      return { safe: false, action, reason, muteUntil, isBanned };
     }
-  });
+
+    return { safe: true };
+  } catch (error) {
+    console.error('Moderation Error:', error);
+    return { safe: true }; // Fail safe
+  }
 };
-
-seedAiEmployees();
-
-initSettings();
-
-// Middleware
-app.use(express.json());
-app.use(cookieParser());
 
 // API Routes
 app.get('/api/health', (req, res) => {
@@ -490,12 +888,16 @@ app.post('/api/auth/register', async (req, res) => {
       if (referrer) referrerId = referrer.id;
     }
 
-    const signupBonusGC = 10000;
-    const signupBonusSC = 5;
-    const referralBonusGC = 1000;
-    const referralBonusSC = 1;
+    const settings = db.prepare('SELECT * FROM site_settings').all() as any[];
+    const settingsMap: any = {};
+    settings.forEach(s => settingsMap[s.key] = s.value);
 
-    let newUserId;
+    const signupBonusGC = parseInt(settingsMap.signup_bonus_gc || '10000');
+    const signupBonusSC = parseFloat(settingsMap.signup_bonus_sc || '5');
+    const referralBonusGC = parseInt(settingsMap.referral_bonus_gc || '1000');
+    const referralBonusSC = parseFloat(settingsMap.referral_bonus_sc || '1');
+
+    let newUserId: any;
 
     const transaction = db.transaction(() => {
       // Create User
@@ -764,8 +1166,8 @@ const seedGames = () => {
   const games = [
     { name: 'Krazy Slots', type: 'slots', slug: 'krazy-slots', rtp: 96.5, min_bet: 1, max_bet: 1000, image_url: 'https://picsum.photos/seed/slots/400/300' },
     { name: 'Neon Dice', type: 'dice', slug: 'neon-dice', rtp: 98.0, min_bet: 1, max_bet: 5000, image_url: 'https://picsum.photos/seed/dice/400/300' },
-    { name: 'Katie Slots', type: 'slots', slug: 'katie-slots', rtp: 97.0, min_bet: 0.01, max_bet: 5.0, image_url: 'https://images.pexels.com/photos/7476134/pexels-photo-7476134.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&dpr=1' },
-    { name: 'CoinKrazy-4EgyptPots', type: 'slots', slug: '4egypt-pots', rtp: 96.0, min_bet: 0.01, max_bet: 5.0, image_url: 'https://images.pexels.com/photos/3352398/pexels-photo-3352398.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&dpr=1' },
+    { name: 'Scratch Tickets', type: 'scratch', slug: 'scratch-tickets', rtp: 94.0, min_bet: 0.5, max_bet: 5, image_url: 'https://picsum.photos/seed/scratch/400/300' },
+    { name: 'Pull Tabs', type: 'pulltab', slug: 'pull-tabs', rtp: 94.0, min_bet: 0.5, max_bet: 5, image_url: 'https://picsum.photos/seed/pulltab/400/300' },
   ];
   
   const insert = db.prepare('INSERT OR IGNORE INTO games (name, type, slug, rtp, min_bet, max_bet, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)');
@@ -840,10 +1242,27 @@ const seedTournaments = () => {
   }
 };
 
+const seedTicketTypes = () => {
+  const types = [
+    { type: 'scratch', name: 'Neon Nights', description: 'Scratch to reveal neon prizes!', price_sc: 1.00, theme_images: JSON.stringify(['https://picsum.photos/seed/neon/800/600']) },
+    { type: 'scratch', name: 'Golden Galaxy', description: 'The universe is full of gold!', price_sc: 5.00, theme_images: JSON.stringify(['https://picsum.photos/seed/galaxy/800/600']) },
+    { type: 'pulltab', name: 'Lucky Leprechaun', description: 'Pull the tabs for the pot of gold!', price_sc: 1.00, theme_images: JSON.stringify(['https://picsum.photos/seed/leprechaun/800/600']) },
+    { type: 'pulltab', name: 'Cherry Blast', description: 'Classic fruit machine pull tabs.', price_sc: 2.00, theme_images: JSON.stringify(['https://picsum.photos/seed/cherry/800/600']) },
+  ];
+
+  const insert = db.prepare('INSERT OR IGNORE INTO ticket_types (type, name, description, price_sc, theme_images) VALUES (?, ?, ?, ?, ?)');
+  const count = db.prepare('SELECT COUNT(*) as count FROM ticket_types').get() as any;
+  if (count.count === 0) {
+    types.forEach(t => insert.run(t.type, t.name, t.description, t.price_sc, t.theme_images));
+    console.log('Ticket types seeded');
+  }
+};
+
 seedGames();
 seedAchievements();
 seedAdmin();
 seedTournaments();
+seedTicketTypes();
 
 // Tournaments Endpoints
 app.get('/api/tournaments', (req: any, res) => {
@@ -1111,177 +1530,6 @@ app.post('/api/games/slots/spin', authenticate, (req: any, res) => {
   }
 });
 
-app.post('/api/games/katie-slots/bet', authenticate, (req: any, res) => {
-  const { betAmount } = req.body;
-  const currency = 'sc'; // Katie slots only works with SC as requested
-
-  try {
-    const user = db.prepare('SELECT sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
-    const game = db.prepare("SELECT * FROM games WHERE slug = 'katie-slots'").get() as any;
-
-    if (!game) return res.status(404).json({ error: 'Game not found' });
-    if (user.sc_balance < betAmount) return res.status(400).json({ error: 'Insufficient SC balance' });
-
-    // Deduct bet immediately
-    const newBalance = user.sc_balance - betAmount;
-
-    // RNG Logic
-    const random = Math.random();
-    const isWin = random < (game.rtp / 100);
-    let winAmount = 0;
-    let multiplier = 0;
-
-    if (isWin) {
-      const winRandom = Math.random();
-      if (winRandom < 0.01) multiplier = 50;
-      else if (winRandom < 0.1) multiplier = 10;
-      else multiplier = 2;
-      winAmount = betAmount * multiplier;
-    }
-
-    const transaction = db.transaction(() => {
-      db.prepare('UPDATE players SET sc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
-        .run(newBalance, betAmount, req.user.id);
-
-      // Log the bet in wallet transactions
-      db.prepare('INSERT INTO wallet_transactions (player_id, type, sc_amount, description) VALUES (?, ?, ?, ?)')
-        .run(req.user.id, 'game_bet', -betAmount, 'Katie Slots Bet');
-
-      if (isWin) {
-        // Store pending win
-        db.prepare('INSERT INTO pending_wins (player_id, game_slug, amount, result_data) VALUES (?, ?, ?, ?)')
-          .run(req.user.id, 'katie-slots', winAmount, JSON.stringify({ multiplier }));
-      }
-    });
-
-    transaction();
-
-    // Notify via socket for real-time balance update
-    io.to(`user-${req.user.id}`).emit('balance-update', {
-      sc_balance: newBalance
-    });
-
-    res.json({
-      isWin,
-      winAmount,
-      multiplier,
-      reels: [
-        Math.floor(Math.random() * 7),
-        Math.floor(Math.random() * 7),
-        Math.floor(Math.random() * 7)
-      ]
-    });
-
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/api/games/katie-slots/claim', authenticate, (req: any, res) => {
-  try {
-    const pendingWin = db.prepare("SELECT * FROM pending_wins WHERE player_id = ? AND game_slug = 'katie-slots' ORDER BY created_at DESC LIMIT 1").get(req.user.id) as any;
-
-    if (!pendingWin) return res.status(400).json({ error: 'No pending win found' });
-
-    const user = db.prepare('SELECT sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
-    const newBalance = user.sc_balance + pendingWin.amount;
-
-    const transaction = db.transaction(() => {
-      db.prepare('UPDATE players SET sc_balance = ? WHERE id = ?').run(newBalance, req.user.id);
-
-      // Log the win in wallet transactions - green (+ amount)
-      db.prepare('INSERT INTO wallet_transactions (player_id, type, sc_amount, description) VALUES (?, ?, ?, ?)')
-        .run(req.user.id, 'game_win', pendingWin.amount, 'Katie Slots Win');
-
-      // Clear pending win
-      db.prepare('DELETE FROM pending_wins WHERE id = ?').run(pendingWin.id);
-    });
-
-    transaction();
-
-    // Notify via socket for real-time balance update
-    io.to(`user-${req.user.id}`).emit('balance-update', {
-      sc_balance: newBalance
-    });
-
-    res.json({ success: true, newBalance });
-
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/api/games/4egypt-pots/spin', authenticate, (req: any, res) => {
-  const { betAmount } = req.body;
-  const currency = 'sc'; // 4 Egypt Pots only works with SC as requested
-
-  try {
-    const user = db.prepare('SELECT sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
-    const game = db.prepare("SELECT * FROM games WHERE slug = '4egypt-pots'").get() as any;
-
-    if (!game) return res.status(404).json({ error: 'Game not found' });
-    if (user.sc_balance < betAmount) return res.status(400).json({ error: 'Insufficient SC balance' });
-
-    // RNG Logic
-    const random = Math.random();
-    const isWin = random < (game.rtp / 100);
-    let winAmount = 0;
-    let multiplier = 0;
-
-    if (isWin) {
-      const winRandom = Math.random();
-      if (winRandom < 0.05) multiplier = 10;
-      else if (winRandom < 0.15) multiplier = 5;
-      else if (winRandom < 0.4) multiplier = 2;
-      else multiplier = 1.5;
-
-      winAmount = betAmount * multiplier;
-      // Limit max win to 10 SC
-      if (winAmount > 10) winAmount = 10;
-    }
-
-    const finalWinAmount = winAmount;
-    const finalBalance = user.sc_balance - betAmount + finalWinAmount;
-
-    db.transaction(() => {
-      // Deduct bet and add win
-      db.prepare('UPDATE players SET sc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
-        .run(finalBalance, betAmount, req.user.id);
-
-      // Log transactions
-      db.prepare('INSERT INTO wallet_transactions (player_id, type, sc_amount, description) VALUES (?, ?, ?, ?)')
-        .run(req.user.id, 'game_bet', -betAmount, 'CoinKrazy-4EgyptPots Bet');
-
-      if (finalWinAmount > 0) {
-        db.prepare('INSERT INTO wallet_transactions (player_id, type, sc_amount, description) VALUES (?, ?, ?, ?)')
-          .run(req.user.id, 'game_win', finalWinAmount, 'CoinKrazy-4EgyptPots Win');
-      }
-
-      // Log result
-      db.prepare('INSERT INTO game_results (player_id, game_id, bet_amount, win_amount, currency, multiplier, result_data) VALUES (?, ?, ?, ?, ?, ?, ?)')
-        .run(req.user.id, game.id, betAmount, finalWinAmount, currency, multiplier, JSON.stringify({ random, isWin }));
-    })();
-
-    io.to(`user-${req.user.id}`).emit('balance-update', { sc_balance: finalBalance });
-
-    res.json({
-      isWin: finalWinAmount > 0,
-      winAmount: finalWinAmount,
-      multiplier,
-      newBalance: finalBalance,
-      reels: [
-        Math.floor(Math.random() * 7),
-        Math.floor(Math.random() * 7),
-        Math.floor(Math.random() * 7),
-        Math.floor(Math.random() * 7),
-        Math.floor(Math.random() * 7)
-      ]
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
 app.post('/api/games/dice/roll', authenticate, (req: any, res) => {
   const { gameId, betAmount, currency, target, type } = req.body; // type: 'over' or 'under'
   
@@ -1368,6 +1616,66 @@ app.get('/api/stats/wagered-history', authenticate, (req: any, res) => {
   }
 });
 
+// Social OAuth Endpoints
+app.get('/api/auth/social/url/:platform', authenticate, (req: any, res) => {
+  const { platform } = req.params;
+  const redirectUri = `${process.env.APP_URL || 'http://localhost:3000'}/auth/social/callback/${platform}`;
+  
+  let authUrl = '';
+  let clientId = '';
+  
+  switch(platform) {
+    case 'facebook':
+      clientId = process.env.FACEBOOK_CLIENT_ID || '';
+      authUrl = `https://www.facebook.com/v12.0/dialog/oauth?client_id=${clientId}&redirect_uri=${redirectUri}&scope=email,user_friends`;
+      break;
+    case 'twitter':
+      clientId = process.env.TWITTER_CLIENT_ID || '';
+      authUrl = `https://twitter.com/i/oauth2/authorize?response_type=code&client_id=${clientId}&redirect_uri=${redirectUri}&scope=tweet.read%20users.read%20follows.read&state=state&code_challenge=challenge&code_challenge_method=plain`;
+      break;
+    case 'instagram':
+      clientId = process.env.INSTAGRAM_CLIENT_ID || '';
+      authUrl = `https://api.instagram.com/oauth/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&scope=user_profile,user_media&response_type=code`;
+      break;
+    case 'tiktok':
+      clientId = process.env.TIKTOK_CLIENT_ID || '';
+      authUrl = `https://www.tiktok.com/auth/authorize/?client_key=${clientId}&scope=user.info.basic&response_type=code&redirect_uri=${redirectUri}`;
+      break;
+    default:
+      return res.status(400).json({ error: 'Unsupported platform' });
+  }
+  
+  res.json({ url: authUrl });
+});
+
+app.get('/auth/social/callback/:platform', async (req, res) => {
+  const { platform } = req.params;
+  const { code } = req.query;
+  
+  // In a real app, we would exchange the code for a token here
+  // For this demo, we'll just simulate success and close the popup
+  
+  res.send(`
+    <html>
+      <body>
+        <script>
+          if (window.opener) {
+            window.opener.postMessage({ 
+              type: 'OAUTH_AUTH_SUCCESS', 
+              platform: '${platform}',
+              username: 'SocialUser_${Math.floor(Math.random() * 1000)}'
+            }, '*');
+            window.close();
+          } else {
+            window.location.href = '/profile';
+          }
+        </script>
+        <p>Authentication successful for ${platform}. This window should close automatically.</p>
+      </body>
+    </html>
+  `);
+});
+
 // Friend Management Endpoints
 
 // Search Users
@@ -1431,6 +1739,41 @@ app.post('/api/friends/accept', authenticate, (req: any, res) => {
     db.prepare('UPDATE friendships SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
       .run('accepted', requestId);
       
+    // Referral Bonus Logic
+    const settings = db.prepare('SELECT * FROM site_settings').all() as any[];
+    const settingsMap: any = {};
+    settings.forEach(s => settingsMap[s.key] = s.value);
+
+    const referralBonusGC = parseInt(settingsMap.referral_bonus_gc || '1000');
+    const referralBonusSC = parseFloat(settingsMap.referral_bonus_sc || '1');
+
+    // Check if they already got a bonus for this friendship (shouldn't happen with 'pending' check but good to be safe)
+    const bonusGiven = db.prepare('SELECT COUNT(*) as count FROM wallet_transactions WHERE player_id = ? AND type = "Referral" AND description LIKE ?')
+      .get(req.user.id, `%friendship with user #${request.user_id}%`) as any;
+
+    if (bonusGiven.count === 0) {
+      const transaction = db.transaction(() => {
+        // Bonus for both
+        db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
+          .run(referralBonusGC, referralBonusSC, request.user_id);
+        db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
+          .run(referralBonusGC, referralBonusSC, request.friend_id);
+
+        // Log Transactions
+        db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+          .run(request.user_id, 'Referral', referralBonusGC, referralBonusSC, `Friendship bonus for adding user #${request.friend_id}`);
+        db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+          .run(request.friend_id, 'Referral', referralBonusGC, referralBonusSC, `Friendship bonus for adding user #${request.user_id}`);
+      });
+      transaction();
+
+      // Notify both via socket
+      [request.user_id, request.friend_id].forEach(uid => {
+        const u = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(uid) as any;
+        io.to(`user-${uid}`).emit('balance-update', u);
+      });
+    }
+
     // Notify sender if online
     io.to(`user-${request.user_id}`).emit('friend-accepted', { 
       by: req.user.username, 
@@ -1496,56 +1839,6 @@ app.get('/api/friends', authenticate, (req: any, res) => {
 
 // Online Users Tracking
 const onlineUsers = new Set<number>();
-
-// Admin Endpoints
-app.get('/api/admin/stats', authenticate, (req: any, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-  
-  try {
-    const totalUsers = db.prepare('SELECT COUNT(*) as count FROM players').get() as any;
-    const totalWagered = db.prepare('SELECT SUM(total_wagered) as total FROM players').get() as any;
-    const recentUsers = db.prepare('SELECT * FROM players ORDER BY created_at DESC LIMIT 5').all();
-    
-    res.json({
-      totalUsers: totalUsers.count,
-      totalWagered: totalWagered.total,
-      recentUsers
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/admin/settings', authenticate, (req: any, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-  
-  try {
-    const settings = db.prepare('SELECT * FROM site_settings').all();
-    const settingsObj: any = {};
-    settings.forEach((s: any) => settingsObj[s.key] = s.value);
-    res.json(settingsObj);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/api/admin/settings', authenticate, (req: any, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-  
-  const settings = req.body;
-  try {
-    const insert = db.prepare('INSERT OR REPLACE INTO site_settings (key, value) VALUES (?, ?)');
-    const transaction = db.transaction(() => {
-      Object.keys(settings).forEach(key => {
-        insert.run(key, String(settings[key]));
-      });
-    });
-    transaction();
-    res.json({ success: true });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
 
 // Admin: Make it Rain
 app.post('/api/admin/rain', authenticate, isAdmin, (req: any, res) => {
@@ -2020,10 +2313,316 @@ app.post('/api/user/social/connect', authenticate, (req: any, res) => {
   }
 });
 
+// Bonus Endpoints
+app.get('/api/admin/bonuses', authenticate, isAdmin, (req, res) => {
+  try {
+    const bonuses = db.prepare('SELECT * FROM bonuses WHERE status != "deleted" ORDER BY created_at DESC').all();
+    res.json({ bonuses });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/bonuses', authenticate, isAdmin, (req, res) => {
+  const { name, type, description, code, reward_gc, reward_sc, min_deposit, wagering_requirement, game_eligibility, max_win, expiration_days } = req.body;
+  try {
+    const result = db.prepare(`
+      INSERT INTO bonuses (name, type, description, code, reward_gc, reward_sc, min_deposit, wagering_requirement, game_eligibility, max_win, expiration_days)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(name, type, description, code, reward_gc, reward_sc, min_deposit, wagering_requirement, JSON.stringify(game_eligibility), max_win, expiration_days);
+    res.json({ id: result.lastInsertRowid });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/admin/bonuses/:id', authenticate, isAdmin, (req, res) => {
+  const { id } = req.params;
+  const { name, type, description, code, reward_gc, reward_sc, min_deposit, wagering_requirement, game_eligibility, max_win, expiration_days, status } = req.body;
+  try {
+    db.prepare(`
+      UPDATE bonuses SET name = ?, type = ?, description = ?, code = ?, reward_gc = ?, reward_sc = ?, min_deposit = ?, wagering_requirement = ?, game_eligibility = ?, max_win = ?, expiration_days = ?, status = ?
+      WHERE id = ?
+    `).run(name, type, description, code, reward_gc, reward_sc, min_deposit, wagering_requirement, JSON.stringify(game_eligibility), max_win, expiration_days, status, id);
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/admin/bonuses/:id', authenticate, isAdmin, (req, res) => {
+  const { id } = req.params;
+  try {
+    db.prepare('UPDATE bonuses SET status = "deleted" WHERE id = ?').run(id);
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/bonuses/available', authenticate, (req, res) => {
+  try {
+    const bonuses = db.prepare('SELECT * FROM bonuses WHERE status = "active"').all();
+    res.json({ bonuses });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/bonuses/my', authenticate, (req: any, res) => {
+  try {
+    const bonuses = db.prepare(`
+      SELECT pb.*, b.name, b.description, b.type, b.reward_gc, b.reward_sc
+      FROM player_bonuses pb
+      JOIN bonuses b ON pb.bonus_id = b.id
+      WHERE pb.player_id = ?
+      ORDER BY pb.claimed_at DESC
+    `).all(req.user.id);
+    res.json({ bonuses });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/bonuses/claim', authenticate, (req: any, res) => {
+  const { bonusId, code } = req.body;
+  try {
+    let bonus;
+    if (code) {
+      bonus = db.prepare('SELECT * FROM bonuses WHERE code = ? AND status = "active"').get(code) as any;
+    } else {
+      bonus = db.prepare('SELECT * FROM bonuses WHERE id = ? AND status = "active"').get(bonusId) as any;
+    }
+
+    if (!bonus) return res.status(404).json({ error: 'Bonus not found or inactive' });
+
+    // Check if already claimed
+    const existing = db.prepare('SELECT id FROM player_bonuses WHERE player_id = ? AND bonus_id = ? AND status = "active"').get(req.user.id, bonus.id);
+    if (existing) return res.status(400).json({ error: 'Bonus already active' });
+
+    const expiresAt = bonus.expiration_days ? new Date(Date.now() + bonus.expiration_days * 24 * 60 * 60 * 1000).toISOString() : null;
+    const wageringTarget = (bonus.reward_sc || 0) * (bonus.wagering_requirement || 0);
+
+    db.transaction(() => {
+      db.prepare(`
+        INSERT INTO player_bonuses (player_id, bonus_id, wagering_target, expires_at)
+        VALUES (?, ?, ?, ?)
+      `).run(req.user.id, bonus.id, wageringTarget, expiresAt);
+
+      // If it's a direct reward (no deposit needed), add it now
+      if (bonus.type === 'loyalty' || bonus.type === 'free_spins') {
+        db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
+          .run(bonus.reward_gc, bonus.reward_sc, req.user.id);
+        
+        db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+          .run(req.user.id, 'Bonus', bonus.reward_gc, bonus.reward_sc, `Claimed bonus: ${bonus.name}`);
+      }
+    })();
+
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Community Endpoints
+app.get('/api/community/boards', authenticate, (req, res) => {
+  try {
+    const boards = db.prepare('SELECT * FROM forum_boards ORDER BY display_order ASC').all();
+    res.json({ boards });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/community/boards/:slug', authenticate, (req, res) => {
+  const { slug } = req.params;
+  try {
+    const board = db.prepare('SELECT * FROM forum_boards WHERE slug = ?').get(slug) as any;
+    if (!board) return res.status(404).json({ error: 'Board not found' });
+
+    const topics = db.prepare(`
+      SELECT t.*, p.username, p.avatar_url,
+      (SELECT COUNT(*) FROM forum_posts WHERE topic_id = t.id) as reply_count
+      FROM forum_topics t
+      JOIN players p ON t.author_id = p.id
+      WHERE t.board_id = ?
+      ORDER BY t.is_pinned DESC, t.updated_at DESC
+    `).all(board.id);
+
+    res.json({ board, topics });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/community/topics/:id', authenticate, (req, res) => {
+  const { id } = req.params;
+  try {
+    const topic = db.prepare(`
+      SELECT t.*, p.username, p.avatar_url, b.name as board_name, b.slug as board_slug
+      FROM forum_topics t
+      JOIN players p ON t.author_id = p.id
+      JOIN forum_boards b ON t.board_id = b.id
+      WHERE t.id = ?
+    `).get(id) as any;
+
+    if (!topic) return res.status(404).json({ error: 'Topic not found' });
+
+    // Increment views
+    db.prepare('UPDATE forum_topics SET views = views + 1 WHERE id = ?').run(id);
+
+    const posts = db.prepare(`
+      SELECT fp.*, p.username, p.avatar_url,
+      (SELECT COUNT(*) FROM forum_likes WHERE post_id = fp.id) as like_count,
+      (SELECT 1 FROM forum_likes WHERE post_id = fp.id AND user_id = ?) as is_liked
+      FROM forum_posts fp
+      JOIN players p ON fp.author_id = p.id
+      WHERE fp.topic_id = ?
+      ORDER BY fp.created_at ASC
+    `).all(req.user.id, id);
+
+    res.json({ topic, posts });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/community/topics', authenticate, async (req: any, res) => {
+  const { boardId, title, content } = req.body;
+  try {
+    // Check community status
+    const status = db.prepare('SELECT * FROM player_community_status WHERE player_id = ?').get(req.user.id) as any;
+    if (status) {
+      if (status.is_banned) return res.status(403).json({ error: 'You are permanently banned from the community.' });
+      if (status.mute_until && new Date(status.mute_until) > new Date()) {
+        return res.status(403).json({ error: `You are muted until ${new Date(status.mute_until).toLocaleString()}` });
+      }
+    }
+
+    // Moderate content
+    const moderation = await moderateContent(req.user.id, `${title} ${content}`, 'forum');
+    if (!moderation.safe) {
+      return res.status(403).json({ 
+        error: `Content violation: ${moderation.reason}`,
+        action: moderation.action,
+        muteUntil: moderation.muteUntil
+      });
+    }
+
+    const result = db.prepare('INSERT INTO forum_topics (board_id, author_id, title, content) VALUES (?, ?, ?, ?)')
+      .run(boardId, req.user.id, title, content);
+    
+    res.json({ id: result.lastInsertRowid });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/community/posts', authenticate, async (req: any, res) => {
+  const { topicId, content, parentId } = req.body;
+  try {
+    // Check community status
+    const status = db.prepare('SELECT * FROM player_community_status WHERE player_id = ?').get(req.user.id) as any;
+    if (status) {
+      if (status.is_banned) return res.status(403).json({ error: 'You are permanently banned from the community.' });
+      if (status.mute_until && new Date(status.mute_until) > new Date()) {
+        return res.status(403).json({ error: `You are muted until ${new Date(status.mute_until).toLocaleString()}` });
+      }
+    }
+
+    // Moderate content
+    const moderation = await moderateContent(req.user.id, content, 'forum');
+    if (!moderation.safe) {
+      return res.status(403).json({ 
+        error: `Content violation: ${moderation.reason}`,
+        action: moderation.action,
+        muteUntil: moderation.muteUntil
+      });
+    }
+
+    const result = db.prepare('INSERT INTO forum_posts (topic_id, author_id, content, parent_id) VALUES (?, ?, ?, ?)')
+      .run(topicId, req.user.id, content, parentId);
+    
+    // Update topic updated_at
+    db.prepare('UPDATE forum_topics SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(topicId);
+
+    res.json({ id: result.lastInsertRowid });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/community/posts/:id/like', authenticate, (req: any, res) => {
+  const { id } = req.params;
+  try {
+    const existing = db.prepare('SELECT * FROM forum_likes WHERE post_id = ? AND user_id = ?').get(id, req.user.id);
+    if (existing) {
+      db.prepare('DELETE FROM forum_likes WHERE post_id = ? AND user_id = ?').run(id, req.user.id);
+      res.json({ liked: false });
+    } else {
+      db.prepare('INSERT INTO forum_likes (post_id, user_id) VALUES (?, ?)').run(id, req.user.id);
+      res.json({ liked: true });
+    }
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/community/moderation-logs', authenticate, isAdmin, (req, res) => {
+  try {
+    const logs = db.prepare(`
+      SELECT ml.*, p.username
+      FROM community_moderation_logs ml
+      JOIN players p ON ml.user_id = p.id
+      ORDER BY ml.created_at DESC
+    `).all();
+    res.json({ logs });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/admin/community/override', authenticate, isAdmin, (req, res) => {
+  const { userId, action } = req.body; // action: 'unban', 'unmute', 'reset_offenses'
+  try {
+    if (action === 'unban') {
+      db.prepare('UPDATE player_community_status SET is_banned = 0 WHERE player_id = ?').run(userId);
+    } else if (action === 'unmute') {
+      db.prepare('UPDATE player_community_status SET mute_until = NULL WHERE player_id = ?').run(userId);
+    } else if (action === 'reset_offenses') {
+      db.prepare('UPDATE player_community_status SET offense_count = 0 WHERE player_id = ?').run(userId);
+    }
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/community/chat/history', authenticate, (req, res) => {
+  try {
+    const messages = db.prepare(`
+      SELECT gm.*, p.username, p.avatar_url
+      FROM global_chat_messages gm
+      JOIN players p ON gm.user_id = p.id
+      ORDER BY gm.created_at DESC
+      LIMIT 50
+    `).all();
+    res.json({ messages: messages.reverse() });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/user/referrals', authenticate, (req: any, res) => {
   try {
     const friends = db.prepare(`
-      SELECT id, username, avatar_url, created_at
+      SELECT id, username, avatar_url, created_at, kyc_status,
+      (SELECT SUM(bet_amount) FROM game_results WHERE player_id = players.id AND currency = 'sc') as total_wagered_sc,
+      CASE 
+        WHEN last_login > datetime('now', '-7 days') THEN 'active'
+        ELSE 'inactive'
+      END as status
       FROM players
       WHERE referred_by = ?
     `).all(req.user.id);
@@ -2144,11 +2743,14 @@ app.post('/api/admin/ai/chat', authenticate, isAdmin, async (req: any, res) => {
   }
 });
 
-app.post('/api/admin/ai/generate-reports', authenticate, isAdmin, async (req: any, res) => {
+// Daily AI Tasks & Reports (Simulated every 24 hours)
+const runDailyAiTasks = async () => {
   try {
     const employees = db.prepare('SELECT * FROM ai_employees').all() as any[];
-    
-    // Generate a report for each employee
+    const devAi = employees.find(e => e.name === 'DevAi');
+    const socialAi = employees.find(e => e.name === 'SocialAi');
+
+    // 1. Standard Daily Reports for all employees
     for (const emp of employees) {
       const prompt = `You are ${emp.name}, a ${emp.role}. Generate a short daily review/report for the admin.
       Include 1 specific suggestion for improvement and 1 status update on your current duties.
@@ -2160,41 +2762,65 @@ app.post('/api/admin/ai/generate-reports', authenticate, isAdmin, async (req: an
       });
       
       const content = response.text || "Daily report generation failed.";
-      
-      db.prepare('INSERT INTO ai_logs (employee_id, type, content, status) VALUES (?, ?, ?, ?)')
+      const logResult = db.prepare('INSERT INTO ai_logs (employee_id, type, content, status) VALUES (?, ?, ?, ?)')
         .run(emp.id, 'review', content, 'pending');
+
+      // Add to central notifications
+      db.prepare('INSERT INTO admin_notifications (type, source_id, title, content) VALUES (?, ?, ?, ?)')
+        .run('ai_task', logResult.lastInsertRowid, `${emp.name} Daily Report`, content);
     }
-    
-    res.json({ success: true });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+
+    // 2. Daily New Games Pipeline (DevAi)
+    if (devAi) {
+      const gamePrompt = `You are DevAi. Crawl major game providers and select 10 best new games. 
+      Recreate them fully branded as PlayCoinKrazy.com and Coin Krazy Studios.
+      Provide a summary of these 10 games.`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: gamePrompt
+      });
+
+      const content = response.text || "Failed to generate new games pipeline.";
+      db.prepare('INSERT INTO admin_notifications (type, title, content) VALUES (?, ?, ?)')
+        .run('game_ready', '10 New Branded Games Ready for Review', content);
+    }
+
+    // 3. Automated Player Retention (SocialAi)
+    if (socialAi) {
+      const retentionPrompt = `You are SocialAi. Run a daily retention campaign.
+      Create personalized emails, in-platform messages, social posts, and SMS texts for inactive players.
+      Include custom incentives (free spins, bonus cash, etc.).
+      Respond with a summary of the campaign.`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: retentionPrompt
+      });
+
+      const content = response.text || "Failed to generate retention campaign.";
+      const campaignResult = db.prepare('INSERT INTO social_campaigns (type, title, content, status) VALUES (?, ?, ?, ?)')
+        .run('retention', 'Daily Player Retention Campaign', JSON.stringify({ summary: content }), 'pending');
+
+      db.prepare('INSERT INTO admin_notifications (type, source_id, title, content) VALUES (?, ?, ?, ?)')
+        .run('social_campaign', campaignResult.lastInsertRowid, 'Daily Retention Campaign Ready', content);
+    }
+
+    console.log('Daily AI Tasks Completed');
+  } catch (error) {
+    console.error('Daily AI Tasks Error:', error);
   }
+};
+
+app.post('/api/admin/ai/generate-reports', authenticate, isAdmin, async (req: any, res) => {
+  await runDailyAiTasks();
+  res.json({ success: true });
 });
 
-// Daily AI Report Generation (Simulated every 12 hours)
-setInterval(async () => {
-  try {
-    const employees = db.prepare('SELECT * FROM ai_employees').all() as any[];
-    for (const emp of employees) {
-      const prompt = `You are ${emp.name}, a ${emp.role}. Generate a short daily review/report for the admin.
-      Include 1 specific suggestion for improvement and 1 status update on your current duties.
-      Keep it concise (under 50 words).`;
-      
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: prompt
-      });
-      
-      const content = response.text || "Daily report generation failed.";
-      
-      db.prepare('INSERT INTO ai_logs (employee_id, type, content, status) VALUES (?, ?, ?, ?)')
-        .run(emp.id, 'review', content, 'pending');
-    }
-    console.log('Automatic AI Reports Generated');
-  } catch (error) {
-    console.error('Auto Report Error:', error);
-  }
-}, 12 * 60 * 60 * 1000);
+// Run daily
+setInterval(runDailyAiTasks, 24 * 60 * 60 * 1000);
+// Run once on startup after a short delay
+setTimeout(runDailyAiTasks, 5000);
 
 // Package Management
 app.post('/api/admin/packages', authenticate, (req: any, res) => {
@@ -2296,11 +2922,64 @@ io.on('connection', (socket) => {
     socket.leave(`game-${gameSlug}`);
   });
 
+  socket.on('join-global-chat', () => {
+    socket.join('global-chat');
+  });
+
+  socket.on('send-global-message', async ({ userId, message }) => {
+    try {
+      // Check community status
+      const status = db.prepare('SELECT * FROM player_community_status WHERE player_id = ?').get(userId) as any;
+      if (status) {
+        if (status.is_banned) {
+          socket.emit('moderation-action', { error: 'You are permanently banned from the community.' });
+          return;
+        }
+        if (status.mute_until && new Date(status.mute_until) > new Date()) {
+          socket.emit('moderation-action', { error: `You are muted until ${new Date(status.mute_until).toLocaleString()}` });
+          return;
+        }
+      }
+
+      // Moderate content
+      const moderation = await moderateContent(userId, message, 'chat');
+      if (!moderation.safe) {
+        socket.emit('moderation-action', { 
+          error: `Content violation: ${moderation.reason}`,
+          action: moderation.action,
+          muteUntil: moderation.muteUntil
+        });
+        return;
+      }
+
+      const user = db.prepare('SELECT username, avatar_url FROM players WHERE id = ?').get(userId) as any;
+      const result = db.prepare('INSERT INTO global_chat_messages (user_id, message) VALUES (?, ?)').run(userId, message);
+      
+      const newMessage = {
+        id: result.lastInsertRowid,
+        userId,
+        username: user.username,
+        avatar_url: user.avatar_url,
+        message,
+        created_at: new Date().toISOString()
+      };
+
+      io.to('global-chat').emit('new-global-message', newMessage);
+    } catch (error) {
+      console.error('Global chat error:', error);
+    }
+  });
+
   socket.on('disconnect', () => {
     console.log('User disconnected:', socket.id);
   });
 });
 
+
+// Run daily
+setInterval(runDailyAiTasks, 24 * 60 * 60 * 1000);
+// Run once on startup after a short delay
+setTimeout(runDailyAiTasks, 5000);
 
 // Vite Integration
 async function startServer() {

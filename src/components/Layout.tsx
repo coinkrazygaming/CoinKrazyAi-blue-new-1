@@ -5,6 +5,7 @@ import {
   Gamepad2, 
   Trophy, 
   User, 
+  Users,
   Wallet, 
   Settings, 
   MessageSquare, 
@@ -13,7 +14,8 @@ import {
   ChevronRight,
   Coins,
   Medal,
-  Users
+  Ticket,
+  Layers
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { Button } from './ui/Button';
@@ -31,10 +33,11 @@ export default function Layout() {
   const navItems = [
     { icon: Home, label: 'Lobby', path: '/' },
     { icon: Gamepad2, label: 'Games', path: '/games' },
-    { icon: Coins, label: 'Slots', path: '/games/slots' },
-    { icon: Users, label: 'Live Casino', path: '/games/live-casino' },
+    { icon: Ticket, label: 'Scratch Tickets', path: '/games/scratch-tickets' },
+    { icon: Layers, label: 'Pull Tabs', path: '/games/pull-tabs' },
     { icon: Trophy, label: 'Leaderboards', path: '/leaderboards' },
     { icon: Medal, label: 'Tournaments', path: '/tournaments' },
+    { icon: Users, label: 'Community', path: '/community' },
     { icon: Wallet, label: 'Wallet', path: '/wallet' },
     { icon: User, label: 'Profile', path: '/profile' },
     { icon: MessageSquare, label: 'Support', path: '/support' },
