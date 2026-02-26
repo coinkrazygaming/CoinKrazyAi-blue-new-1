@@ -12,7 +12,8 @@ import {
   X,
   ChevronRight,
   Coins,
-  Medal
+  Medal,
+  Users
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { Button } from './ui/Button';
