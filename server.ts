@@ -1164,14 +1164,14 @@ app.post('/api/user/profile/update', authenticate, (req: any, res) => {
 // Seed Games
 const seedGames = () => {
   const games = [
-    { name: 'Krazy Slots', type: 'slots', slug: 'krazy-slots', rtp: 96.5, min_bet: 1, max_bet: 1000, image_url: 'https://picsum.photos/seed/slots/400/300' },
-    { name: 'Neon Dice', type: 'dice', slug: 'neon-dice', rtp: 98.0, min_bet: 1, max_bet: 5000, image_url: 'https://picsum.photos/seed/dice/400/300' },
-    { name: 'Scratch Tickets', type: 'scratch', slug: 'scratch-tickets', rtp: 94.0, min_bet: 0.5, max_bet: 5, image_url: 'https://picsum.photos/seed/scratch/400/300' },
-    { name: 'Pull Tabs', type: 'pulltab', slug: 'pull-tabs', rtp: 94.0, min_bet: 0.5, max_bet: 5, image_url: 'https://picsum.photos/seed/pulltab/400/300' },
+    { name: 'Krazy Slots', type: 'slots', slug: 'krazy-slots', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/slots/400/300' },
+    { name: 'Neon Dice', type: 'dice', slug: 'neon-dice', rtp: 98.0, min_bet: 1, max_bet: 5000, thumbnail_url: 'https://picsum.photos/seed/dice/400/300' },
+    { name: 'Scratch Tickets', type: 'scratch', slug: 'scratch-tickets', rtp: 94.0, min_bet: 0.5, max_bet: 5, thumbnail_url: 'https://picsum.photos/seed/scratch/400/300' },
+    { name: 'Pull Tabs', type: 'pulltab', slug: 'pull-tabs', rtp: 94.0, min_bet: 0.5, max_bet: 5, thumbnail_url: 'https://picsum.photos/seed/pulltab/400/300' },
   ];
-  
-  const insert = db.prepare('INSERT OR IGNORE INTO games (name, type, slug, rtp, min_bet, max_bet, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)');
-  games.forEach(g => insert.run(g.name, g.type, g.slug, g.rtp, g.min_bet, g.max_bet, g.image_url));
+
+  const insert = db.prepare('INSERT OR IGNORE INTO games (name, type, slug, rtp, min_bet, max_bet, thumbnail_url) VALUES (?, ?, ?, ?, ?, ?, ?)');
+  games.forEach(g => insert.run(g.name, g.type, g.slug, g.rtp, g.min_bet, g.max_bet, g.thumbnail_url));
 };
 
 const seedAchievements = () => {
@@ -1244,16 +1244,16 @@ const seedTournaments = () => {
 
 const seedTicketTypes = () => {
   const types = [
-    { type: 'scratch', name: 'Neon Nights', description: 'Scratch to reveal neon prizes!', price_sc: 1.00, theme_images: JSON.stringify(['https://picsum.photos/seed/neon/800/600']) },
-    { type: 'scratch', name: 'Golden Galaxy', description: 'The universe is full of gold!', price_sc: 5.00, theme_images: JSON.stringify(['https://picsum.photos/seed/galaxy/800/600']) },
-    { type: 'pulltab', name: 'Lucky Leprechaun', description: 'Pull the tabs for the pot of gold!', price_sc: 1.00, theme_images: JSON.stringify(['https://picsum.photos/seed/leprechaun/800/600']) },
-    { type: 'pulltab', name: 'Cherry Blast', description: 'Classic fruit machine pull tabs.', price_sc: 2.00, theme_images: JSON.stringify(['https://picsum.photos/seed/cherry/800/600']) },
+    { type: 'scratch', name: 'Neon Nights', odds_description: 'Scratch to reveal neon prizes!', price_sc: 1.00, top_prize_sc: 50, total_tickets: 1000, remaining_tickets: 1000, theme_images: JSON.stringify(['https://picsum.photos/seed/neon/800/600']) },
+    { type: 'scratch', name: 'Golden Galaxy', odds_description: 'The universe is full of gold!', price_sc: 5.00, top_prize_sc: 500, total_tickets: 500, remaining_tickets: 500, theme_images: JSON.stringify(['https://picsum.photos/seed/galaxy/800/600']) },
+    { type: 'pulltab', name: 'Lucky Leprechaun', odds_description: 'Pull the tabs for the pot of gold!', price_sc: 1.00, top_prize_sc: 100, total_tickets: 1000, remaining_tickets: 1000, theme_images: JSON.stringify(['https://picsum.photos/seed/leprechaun/800/600']) },
+    { type: 'pulltab', name: 'Cherry Blast', odds_description: 'Classic fruit machine pull tabs.', price_sc: 2.00, top_prize_sc: 200, total_tickets: 500, remaining_tickets: 500, theme_images: JSON.stringify(['https://picsum.photos/seed/cherry/800/600']) },
   ];
 
-  const insert = db.prepare('INSERT OR IGNORE INTO ticket_types (type, name, description, price_sc, theme_images) VALUES (?, ?, ?, ?, ?)');
+  const insert = db.prepare('INSERT OR IGNORE INTO ticket_types (type, name, price_sc, top_prize_sc, total_tickets, remaining_tickets, odds_description, theme_images) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
   const count = db.prepare('SELECT COUNT(*) as count FROM ticket_types').get() as any;
   if (count.count === 0) {
-    types.forEach(t => insert.run(t.type, t.name, t.description, t.price_sc, t.theme_images));
+    types.forEach(t => insert.run(t.type, t.name, t.price_sc, t.top_prize_sc, t.total_tickets, t.remaining_tickets, t.odds_description, t.theme_images));
     console.log('Ticket types seeded');
   }
 };
