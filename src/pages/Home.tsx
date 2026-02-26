@@ -19,6 +19,7 @@ export default function Home() {
   const featuredGames = [
     { id: 1, name: 'Krazy Slots', type: 'Slots', image: 'https://picsum.photos/seed/slots/400/300', slug: 'krazy-slots' },
     { id: 2, name: 'Neon Dice', type: 'Dice', image: 'https://picsum.photos/seed/dice/400/300', slug: 'neon-dice' },
+    { id: 3, name: 'CoinKrazy-4EgyptPots', type: 'Slots', image: 'https://images.pexels.com/photos/3352398/pexels-photo-3352398.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&dpr=1', slug: '4egypt-pots' },
   ];
 
   return (
@@ -82,7 +83,7 @@ export default function Home() {
           </Link>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
           {featuredGames.map((game, idx) => (
             <motion.div
               key={game.id}

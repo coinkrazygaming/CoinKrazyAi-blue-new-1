@@ -5,8 +5,11 @@ import Layout from './components/Layout';
 import Home from './pages/Home';
 import Wallet from './pages/Wallet';
 import Games from './pages/Games';
+import SlotsPage from './pages/SlotsPage';
+import LiveCasinoPage from './pages/LiveCasinoPage';
 import Slots from './pages/games/Slots';
 import KatieSlots from './pages/games/KatieSlots';
+import FourEgyptPots from './pages/games/FourEgyptPots';
 import Dice from './pages/games/Dice';
 import Leaderboards from './pages/Leaderboards';
 import Tournaments from './pages/Tournaments';
@@ -30,8 +33,11 @@ export default function App() {
             <Route path="/" element={<Layout />}>
               <Route index element={<Home />} />
               <Route path="games" element={<Games />} />
+              <Route path="games/slots" element={<SlotsPage />} />
+              <Route path="games/live-casino" element={<LiveCasinoPage />} />
               <Route path="games/krazy-slots" element={<Slots />} />
               <Route path="games/katie-slots" element={<KatieSlots />} />
+              <Route path="games/4egypt-pots" element={<FourEgyptPots />} />
               <Route path="games/neon-dice" element={<Dice />} />
               <Route path="leaderboards" element={<Leaderboards />} />
               <Route path="tournaments" element={<Tournaments />} />

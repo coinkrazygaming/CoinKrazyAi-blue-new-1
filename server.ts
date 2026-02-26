@@ -765,6 +765,7 @@ const seedGames = () => {
     { name: 'Krazy Slots', type: 'slots', slug: 'krazy-slots', rtp: 96.5, min_bet: 1, max_bet: 1000, image_url: 'https://picsum.photos/seed/slots/400/300' },
     { name: 'Neon Dice', type: 'dice', slug: 'neon-dice', rtp: 98.0, min_bet: 1, max_bet: 5000, image_url: 'https://picsum.photos/seed/dice/400/300' },
     { name: 'Katie Slots', type: 'slots', slug: 'katie-slots', rtp: 97.0, min_bet: 0.01, max_bet: 5.0, image_url: 'https://images.pexels.com/photos/7476134/pexels-photo-7476134.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&dpr=1' },
+    { name: 'CoinKrazy-4EgyptPots', type: 'slots', slug: '4egypt-pots', rtp: 96.0, min_bet: 0.01, max_bet: 5.0, image_url: 'https://images.pexels.com/photos/3352398/pexels-photo-3352398.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&dpr=1' },
   ];
   
   const insert = db.prepare('INSERT OR IGNORE INTO games (name, type, slug, rtp, min_bet, max_bet, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)');
@@ -1205,6 +1206,77 @@ app.post('/api/games/katie-slots/claim', authenticate, (req: any, res) => {
 
     res.json({ success: true, newBalance });
 
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/games/4egypt-pots/spin', authenticate, (req: any, res) => {
+  const { betAmount } = req.body;
+  const currency = 'sc'; // 4 Egypt Pots only works with SC as requested
+
+  try {
+    const user = db.prepare('SELECT sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
+    const game = db.prepare("SELECT * FROM games WHERE slug = '4egypt-pots'").get() as any;
+
+    if (!game) return res.status(404).json({ error: 'Game not found' });
+    if (user.sc_balance < betAmount) return res.status(400).json({ error: 'Insufficient SC balance' });
+
+    // RNG Logic
+    const random = Math.random();
+    const isWin = random < (game.rtp / 100);
+    let winAmount = 0;
+    let multiplier = 0;
+
+    if (isWin) {
+      const winRandom = Math.random();
+      if (winRandom < 0.05) multiplier = 10;
+      else if (winRandom < 0.15) multiplier = 5;
+      else if (winRandom < 0.4) multiplier = 2;
+      else multiplier = 1.5;
+
+      winAmount = betAmount * multiplier;
+      // Limit max win to 10 SC
+      if (winAmount > 10) winAmount = 10;
+    }
+
+    const finalWinAmount = winAmount;
+    const finalBalance = user.sc_balance - betAmount + finalWinAmount;
+
+    db.transaction(() => {
+      // Deduct bet and add win
+      db.prepare('UPDATE players SET sc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
+        .run(finalBalance, betAmount, req.user.id);
+
+      // Log transactions
+      db.prepare('INSERT INTO wallet_transactions (player_id, type, sc_amount, description) VALUES (?, ?, ?, ?)')
+        .run(req.user.id, 'game_bet', -betAmount, 'CoinKrazy-4EgyptPots Bet');
+
+      if (finalWinAmount > 0) {
+        db.prepare('INSERT INTO wallet_transactions (player_id, type, sc_amount, description) VALUES (?, ?, ?, ?)')
+          .run(req.user.id, 'game_win', finalWinAmount, 'CoinKrazy-4EgyptPots Win');
+      }
+
+      // Log result
+      db.prepare('INSERT INTO game_results (player_id, game_id, bet_amount, win_amount, currency, multiplier, result_data) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(req.user.id, game.id, betAmount, finalWinAmount, currency, multiplier, JSON.stringify({ random, isWin }));
+    })();
+
+    io.to(`user-${req.user.id}`).emit('balance-update', { sc_balance: finalBalance });
+
+    res.json({
+      isWin: finalWinAmount > 0,
+      winAmount: finalWinAmount,
+      multiplier,
+      newBalance: finalBalance,
+      reels: [
+        Math.floor(Math.random() * 7),
+        Math.floor(Math.random() * 7),
+        Math.floor(Math.random() * 7),
+        Math.floor(Math.random() * 7),
+        Math.floor(Math.random() * 7)
+      ]
+    });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }

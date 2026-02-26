@@ -30,6 +30,8 @@ export default function Layout() {
   const navItems = [
     { icon: Home, label: 'Lobby', path: '/' },
     { icon: Gamepad2, label: 'Games', path: '/games' },
+    { icon: Coins, label: 'Slots', path: '/games/slots' },
+    { icon: Users, label: 'Live Casino', path: '/games/live-casino' },
     { icon: Trophy, label: 'Leaderboards', path: '/leaderboards' },
     { icon: Medal, label: 'Tournaments', path: '/tournaments' },
     { icon: Wallet, label: 'Wallet', path: '/wallet' },
