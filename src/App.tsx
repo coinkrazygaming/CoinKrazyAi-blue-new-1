@@ -6,6 +6,7 @@ import Home from './pages/Home';
 import Wallet from './pages/Wallet';
 import Games from './pages/Games';
 import Slots from './pages/games/Slots';
+import KatieSlots from './pages/games/KatieSlots';
 import Dice from './pages/games/Dice';
 import Leaderboards from './pages/Leaderboards';
 import Tournaments from './pages/Tournaments';
@@ -30,6 +31,7 @@ export default function App() {
               <Route index element={<Home />} />
               <Route path="games" element={<Games />} />
               <Route path="games/krazy-slots" element={<Slots />} />
+              <Route path="games/katie-slots" element={<KatieSlots />} />
               <Route path="games/neon-dice" element={<Dice />} />
               <Route path="leaderboards" element={<Leaderboards />} />
               <Route path="tournaments" element={<Tournaments />} />

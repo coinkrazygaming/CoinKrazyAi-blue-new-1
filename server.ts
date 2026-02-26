@@ -375,6 +375,16 @@ db.exec(`
     ip_address TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+
+  CREATE TABLE IF NOT EXISTS pending_wins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL,
+    game_slug TEXT NOT NULL,
+    amount REAL NOT NULL,
+    result_data TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(player_id) REFERENCES players(id)
+  );
 `);
 
 // Migration for existing DB
@@ -754,6 +764,7 @@ const seedGames = () => {
   const games = [
     { name: 'Krazy Slots', type: 'slots', slug: 'krazy-slots', rtp: 96.5, min_bet: 1, max_bet: 1000, image_url: 'https://picsum.photos/seed/slots/400/300' },
     { name: 'Neon Dice', type: 'dice', slug: 'neon-dice', rtp: 98.0, min_bet: 1, max_bet: 5000, image_url: 'https://picsum.photos/seed/dice/400/300' },
+    { name: 'Katie Slots', type: 'slots', slug: 'katie-slots', rtp: 97.0, min_bet: 0.01, max_bet: 5.0, image_url: 'https://images.pexels.com/photos/7476134/pexels-photo-7476134.jpeg?auto=compress&cs=tinysrgb&w=400&h=300&dpr=1' },
   ];
   
   const insert = db.prepare('INSERT OR IGNORE INTO games (name, type, slug, rtp, min_bet, max_bet, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)');
@@ -1094,6 +1105,106 @@ app.post('/api/games/slots/spin', authenticate, (req: any, res) => {
       sc_balance: currency === 'sc' ? newBalance : user.sc_balance
     });
     
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/games/katie-slots/bet', authenticate, (req: any, res) => {
+  const { betAmount } = req.body;
+  const currency = 'sc'; // Katie slots only works with SC as requested
+
+  try {
+    const user = db.prepare('SELECT sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
+    const game = db.prepare("SELECT * FROM games WHERE slug = 'katie-slots'").get() as any;
+
+    if (!game) return res.status(404).json({ error: 'Game not found' });
+    if (user.sc_balance < betAmount) return res.status(400).json({ error: 'Insufficient SC balance' });
+
+    // Deduct bet immediately
+    const newBalance = user.sc_balance - betAmount;
+
+    // RNG Logic
+    const random = Math.random();
+    const isWin = random < (game.rtp / 100);
+    let winAmount = 0;
+    let multiplier = 0;
+
+    if (isWin) {
+      const winRandom = Math.random();
+      if (winRandom < 0.01) multiplier = 50;
+      else if (winRandom < 0.1) multiplier = 10;
+      else multiplier = 2;
+      winAmount = betAmount * multiplier;
+    }
+
+    const transaction = db.transaction(() => {
+      db.prepare('UPDATE players SET sc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
+        .run(newBalance, betAmount, req.user.id);
+
+      // Log the bet in wallet transactions
+      db.prepare('INSERT INTO wallet_transactions (player_id, type, sc_amount, description) VALUES (?, ?, ?, ?)')
+        .run(req.user.id, 'game_bet', -betAmount, 'Katie Slots Bet');
+
+      if (isWin) {
+        // Store pending win
+        db.prepare('INSERT INTO pending_wins (player_id, game_slug, amount, result_data) VALUES (?, ?, ?, ?)')
+          .run(req.user.id, 'katie-slots', winAmount, JSON.stringify({ multiplier }));
+      }
+    });
+
+    transaction();
+
+    // Notify via socket for real-time balance update
+    io.to(`user-${req.user.id}`).emit('balance-update', {
+      sc_balance: newBalance
+    });
+
+    res.json({
+      isWin,
+      winAmount,
+      multiplier,
+      reels: [
+        Math.floor(Math.random() * 7),
+        Math.floor(Math.random() * 7),
+        Math.floor(Math.random() * 7)
+      ]
+    });
+
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/games/katie-slots/claim', authenticate, (req: any, res) => {
+  try {
+    const pendingWin = db.prepare("SELECT * FROM pending_wins WHERE player_id = ? AND game_slug = 'katie-slots' ORDER BY created_at DESC LIMIT 1").get(req.user.id) as any;
+
+    if (!pendingWin) return res.status(400).json({ error: 'No pending win found' });
+
+    const user = db.prepare('SELECT sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
+    const newBalance = user.sc_balance + pendingWin.amount;
+
+    const transaction = db.transaction(() => {
+      db.prepare('UPDATE players SET sc_balance = ? WHERE id = ?').run(newBalance, req.user.id);
+
+      // Log the win in wallet transactions - green (+ amount)
+      db.prepare('INSERT INTO wallet_transactions (player_id, type, sc_amount, description) VALUES (?, ?, ?, ?)')
+        .run(req.user.id, 'game_win', pendingWin.amount, 'Katie Slots Win');
+
+      // Clear pending win
+      db.prepare('DELETE FROM pending_wins WHERE id = ?').run(pendingWin.id);
+    });
+
+    transaction();
+
+    // Notify via socket for real-time balance update
+    io.to(`user-${req.user.id}`).emit('balance-update', {
+      sc_balance: newBalance
+    });
+
+    res.json({ success: true, newBalance });
+
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }

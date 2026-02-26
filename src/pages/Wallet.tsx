@@ -357,11 +357,21 @@ export default function Wallet() {
                       <td className="px-6 py-4 text-sm text-slate-300">{tx.description}</td>
                       <td className="px-6 py-4 text-right">
                         <div className="flex flex-col items-end">
-                          {tx.gc_amount > 0 && (
-                            <span className="text-xs font-bold text-yellow-500">+{tx.gc_amount.toLocaleString()} GC</span>
+                          {tx.gc_amount !== 0 && (
+                            <span className={cn(
+                              "text-xs font-bold",
+                              tx.gc_amount > 0 ? "text-yellow-500" : "text-red-500"
+                            )}>
+                              {tx.gc_amount > 0 ? '+' : ''}{tx.gc_amount.toLocaleString()} GC
+                            </span>
                           )}
-                          {tx.sc_amount > 0 && (
-                            <span className="text-xs font-bold text-emerald-500">+{tx.sc_amount.toFixed(2)} SC</span>
+                          {tx.sc_amount !== 0 && (
+                            <span className={cn(
+                              "text-xs font-bold",
+                              tx.sc_amount > 0 ? "text-emerald-500" : "text-red-500"
+                            )}>
+                              {tx.sc_amount > 0 ? '+' : ''}{tx.sc_amount.toFixed(2)} SC
+                            </span>
                           )}
                         </div>
                       </td>
