@@ -9,7 +9,6 @@ import Database from 'better-sqlite3';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { GoogleGenAI } from "@google/genai";
-import Stripe from 'stripe';
 
 dotenv.config();
 
@@ -24,30 +23,17 @@ const io = new Server(httpServer, {
   }
 });
 
-// Initialize Gemini AI (optional - some features won't work without it)
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
-
-// Log AI initialization status
-if (!GEMINI_API_KEY) {
-  console.warn('⚠️  GEMINI_API_KEY not set. AI features will be disabled or degraded.');
+let ai: GoogleGenAI | null = null;
+try {
+  if (process.env.GEMINI_API_KEY) {
+    ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+  }
+} catch (e) {
+  console.warn('Failed to initialize GoogleGenAI:', e);
 }
 
 const JWT_SECRET = process.env.JWT_SECRET || 'coinkrazy-secret-key-123';
 const PORT = 3000;
-
-// Initialize Stripe
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
-let stripe: Stripe | null = null;
-
-if (STRIPE_SECRET_KEY) {
-  stripe = new Stripe(STRIPE_SECRET_KEY, {
-    apiVersion: '2024-11-20',
-  });
-  console.log('✅ Stripe initialized successfully');
-} else {
-  console.warn('⚠️  STRIPE_SECRET_KEY not set. Payment processing will be disabled.');
-}
 
 // Database Setup
 const db = new Database('coinkrazy.db');
@@ -69,10 +55,7 @@ db.exec(`
     status TEXT DEFAULT 'Active',
     role TEXT DEFAULT 'player',
     referred_by INTEGER,
-    referral_code TEXT UNIQUE,
-    cashapp_tag TEXT,
     last_login DATETIME DEFAULT CURRENT_TIMESTAMP,
-    last_bonus_claim DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     kyc_status TEXT DEFAULT 'unverified'
   );
@@ -200,7 +183,6 @@ db.exec(`
     currency TEXT NOT NULL,
     multiplier REAL,
     details TEXT,
-    result_data TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(player_id) REFERENCES players(id),
     FOREIGN KEY(game_id) REFERENCES games(id)
@@ -217,9 +199,6 @@ db.exec(`
     odds_description TEXT,
     theme_images TEXT, -- JSON array of image URLs
     is_active INTEGER DEFAULT 1,
-    win_probability REAL DEFAULT 0.142857,
-    min_prize REAL DEFAULT 1.0,
-    max_prize REAL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
@@ -231,8 +210,6 @@ db.exec(`
     is_win INTEGER DEFAULT 0,
     win_amount REAL DEFAULT 0,
     reveal_data TEXT, -- JSON of what was revealed
-    result_data TEXT,
-    cost_sc REAL NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(player_id) REFERENCES players(id),
     FOREIGN KEY(ticket_type_id) REFERENCES ticket_types(id)
@@ -314,19 +291,6 @@ db.exec(`
     amount_sc REAL NOT NULL,
     method TEXT NOT NULL,
     details TEXT,
-    status TEXT DEFAULT 'pending', -- pending, approved, rejected, paid
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    processed_at DATETIME,
-    FOREIGN KEY(player_id) REFERENCES players(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS redemption_requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    amount_sc REAL NOT NULL,
-    payout_amount REAL NOT NULL,
-    payment_method TEXT NOT NULL,
-    payment_details TEXT,
     status TEXT DEFAULT 'pending', -- pending, approved, rejected, paid
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     processed_at DATETIME,
@@ -702,7 +666,7 @@ app.post('/api/admin/ai/game-builder/chat', authenticate, isAdmin, async (req: a
     Respond in character as DevAi. If you are starting a build, suggest variations. If you are in the middle of a build, show the next step's preview data.`;
 
     if (!ai) {
-      return res.status(503).json({ error: 'AI features are currently unavailable. Please set GEMINI_API_KEY environment variable.' });
+      return res.status(503).json({ error: 'AI Service is currently unavailable. Please check your GEMINI_API_KEY.' });
     }
 
     const aiResponse = await ai.models.generateContent({
@@ -739,103 +703,13 @@ app.post('/api/admin/ai/game-builder/chat', authenticate, isAdmin, async (req: a
     db.prepare('UPDATE game_builder_sessions SET history = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
       .run(JSON.stringify(history), session.id);
 
-    res.json({
-      success: true,
+    res.json({ 
+      success: true, 
       sessionId: session.id,
       ...responseData
     });
   } catch (error: any) {
     console.error('Game Builder Error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Deploy AI-Built Game to Production
-app.post('/api/admin/ai/game-builder/deploy', authenticate, isAdmin, async (req: any, res) => {
-  const { sessionId, gameData } = req.body;
-
-  try {
-    let sessionData: any;
-    if (sessionId) {
-      sessionData = db.prepare('SELECT history FROM game_builder_sessions WHERE id = ?').get(sessionId) as any;
-      if (!sessionData) return res.status(400).json({ error: 'Session not found' });
-    } else if (!gameData) {
-      return res.status(400).json({ error: 'Either sessionId or gameData must be provided' });
-    }
-
-    const history = sessionData ? JSON.parse(sessionData.history || '[]') : [];
-
-    // Extract final game data from AI history
-    const finalStep = history.reverse().find((h: any) => h.preview?.step === 'final' || h.preview?.step === 'ui' || h.preview);
-    const finalData = gameData || finalStep?.preview || {};
-
-    if (!finalData.title) {
-      return res.status(400).json({ error: 'Game title is required' });
-    }
-
-    // Generate game slug from title
-    const slug = finalData.title
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '');
-
-    // Check if slug already exists
-    const existingGame = db.prepare('SELECT id FROM games WHERE slug = ?').get(slug) as any;
-    if (existingGame) {
-      return res.status(400).json({ error: `Game with slug "${slug}" already exists` });
-    }
-
-    // Create the game
-    const result = db.prepare(`
-      INSERT INTO games (name, slug, type, description, thumbnail_url, rtp, min_bet, max_bet, enabled, is_featured)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
-    `).run(
-      finalData.title,
-      slug,
-      finalData.config?.type || 'slots',
-      finalData.description || '',
-      finalData.image_url || 'https://picsum.photos/seed/game/400/300',
-      finalData.config?.rtp || 95.0,
-      finalData.config?.minBet || 0.1,
-      finalData.config?.maxBet || 100.0
-    );
-
-    // Store game configuration
-    const gameId = result.lastInsertRowid;
-    if (finalData.config) {
-      db.prepare(`
-        INSERT INTO game_builder_sessions (admin_id, game_id, history)
-        VALUES (?, ?, ?)
-      `).run(req.user.id, gameId, JSON.stringify([{ config: finalData.config }]));
-    }
-
-    // Log admin action
-    db.prepare(`
-      INSERT INTO admin_notifications (type, source_id, title, content, status)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(
-      'game_ready',
-      gameId,
-      `New Game Deployed: ${finalData.title}`,
-      `Admin ${req.user.id} deployed a new game using AI Game Builder`,
-      'approved'
-    );
-
-    console.log(`✅ Game deployed: ${finalData.title} (${slug})`);
-
-    res.json({
-      success: true,
-      game: {
-        id: gameId,
-        name: finalData.title,
-        slug,
-        type: finalData.config?.type || 'slots',
-        description: finalData.description || '',
-        thumbnail_url: finalData.image_url
-      }
-    });
-  } catch (error: any) {
-    console.error('Game Deploy Error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -864,10 +738,6 @@ app.post('/api/admin/social/generate', authenticate, isAdmin, async (req: any, r
     - For retention: Include a personalized incentive (e.g. "Use code BACK25 for 25 free spins").
     
     Respond with JSON.`;
-
-    if (!ai) {
-      return res.status(503).json({ error: 'AI features are currently unavailable. Please set GEMINI_API_KEY environment variable.' });
-    }
 
     const aiResponse = await ai.models.generateContent({
       model: 'gemini-3-flash-preview',
@@ -943,19 +813,15 @@ app.get('/api/ticker', (req, res) => {
 // SecurityAi Moderation Logic
 const moderateContent = async (userId: number, content: string, type: 'chat' | 'forum') => {
   try {
-    // If AI is not available, allow content (graceful degradation)
-    if (!ai) {
-      console.warn('⚠️  Content moderation skipped - AI unavailable');
-      return { safe: true, reason: '', action: null, muteUntil: null };
-    }
-
-    const prompt = `You are SecurityAi, the site moderator for PlayCoinKrazy.com.
+    const prompt = `You are SecurityAi, the site moderator for PlayCoinKrazy.com. 
     Analyze the following ${type} content for swearing, slurs, advertisement links, spam, or off-topic promotions.
     Content: "${content}"
-
+    
     If the content is safe, respond with "SAFE".
     If the content violates rules, respond with "VIOLATION: [Reason]".
     Be strict. Zero tolerance.`;
+
+    if (!ai) return { safe: true };
 
     const response = await ai.models.generateContent({
       model: 'gemini-3-flash-preview',
@@ -1207,99 +1073,29 @@ app.get('/api/store/packages', authenticate, (req: any, res) => {
   }
 });
 
-// Payment verification helper - Stripe integration
-const verifyPayment = async (paymentIntentId: string): Promise<boolean> => {
-  if (!stripe) {
-    console.warn('⚠️  Stripe not initialized. Payment verification disabled.');
-    return false;
-  }
-
-  try {
-    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
-
-    console.log(`[Payment Verification] Intent: ${paymentIntentId}, Status: ${paymentIntent.status}`);
-
-    // Check if payment was successful
-    if (paymentIntent.status === 'succeeded') {
-      return true;
-    } else if (paymentIntent.status === 'processing' || paymentIntent.status === 'requires_action') {
-      // Payment is processing, allow but should check later
-      console.log(`Payment ${paymentIntentId} is still processing`);
-      return false;
-    } else {
-      console.warn(`Payment failed: ${paymentIntent.status}`);
-      return false;
-    }
-  } catch (error: any) {
-    console.error('Payment verification error:', error.message);
-    return false;
-  }
-};
-
-// Create Payment Intent endpoint
-app.post('/api/payments/create-intent', authenticate, async (req: any, res) => {
-  const { packId } = req.body;
-
-  try {
-    if (!stripe) {
-      return res.status(503).json({ error: 'Payment processing is currently unavailable' });
-    }
-
-    const pack = db.prepare('SELECT * FROM coin_packages WHERE id = ?').get(packId) as any;
-    if (!pack) return res.status(400).json({ error: 'Invalid pack' });
-
-    // Convert amount to cents for Stripe
-    const amountInCents = Math.round(pack.price * 100);
-
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: amountInCents,
-      currency: 'usd',
-      metadata: {
-        packId: packId.toString(),
-        userId: req.user.id.toString(),
-        gcAmount: pack.gc_amount.toString(),
-        scAmount: pack.sc_amount.toString(),
-      },
-    });
-
-    res.json({
-      clientSecret: paymentIntent.client_secret,
-      paymentIntentId: paymentIntent.id,
-    });
-  } catch (error: any) {
-    console.error('Error creating payment intent:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/api/store/purchase', authenticate, async (req: any, res) => {
-  const { packId, paymentIntentId } = req.body;
-
+app.post('/api/store/purchase', authenticate, (req: any, res) => {
+  const { packId, paymentMethod } = req.body; // paymentMethod: 'cashapp' or 'googlepay'
+  
   try {
     const pack = db.prepare('SELECT * FROM coin_packages WHERE id = ?').get(packId) as any;
     if (!pack) return res.status(400).json({ error: 'Invalid pack' });
-
-    // Verify payment with Stripe
-    const paymentVerified = await verifyPayment(paymentIntentId);
-
-    if (!paymentVerified) {
-      return res.status(402).json({ error: 'Payment verification failed. Please try again.' });
-    }
-
+    
+    // In a real app, we would verify payment here
+    
     const transaction = db.transaction(() => {
       // Update player balance
       db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
         .run(pack.gc_amount, pack.sc_amount, req.user.id);
-
-      // Log transaction with Stripe reference
+      
+      // Log transaction
       db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
-        .run(req.user.id, 'purchase', pack.gc_amount, pack.sc_amount, `Purchased ${pack.name} (Stripe: ${paymentIntentId})`);
+        .run(req.user.id, 'purchase', pack.gc_amount, pack.sc_amount, `Purchased ${pack.name} via ${paymentMethod}`);
     });
-
+    
     transaction();
-
+    
     const user = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
-
+    
     // Notify via socket
     io.to(`user-${req.user.id}`).emit('balance-update', {
       gc_balance: user.gc_balance,
@@ -1309,57 +1105,6 @@ app.post('/api/store/purchase', authenticate, async (req: any, res) => {
     res.json({ success: true, balances: user });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
-  }
-});
-
-// Stripe Webhook Endpoint
-app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req: any, res) => {
-  const sig = req.headers['stripe-signature'];
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-
-  if (!stripe || !webhookSecret) {
-    return res.status(503).json({ error: 'Webhook not configured' });
-  }
-
-  try {
-    const event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-
-    // Handle payment intent succeeded
-    if (event.type === 'payment_intent.succeeded') {
-      const paymentIntent = event.data.object as any;
-      const { packId, userId, gcAmount, scAmount } = paymentIntent.metadata;
-
-      // Award coins to player
-      const transaction = db.transaction(() => {
-        db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
-          .run(parseFloat(gcAmount), parseFloat(scAmount), parseInt(userId));
-
-        db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
-          .run(parseInt(userId), 'purchase', parseFloat(gcAmount), parseFloat(scAmount), `Purchased coins (Stripe: ${paymentIntent.id})`);
-      });
-
-      transaction();
-
-      // Notify user via socket
-      const user = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(parseInt(userId)) as any;
-      io.to(`user-${userId}`).emit('balance-update', {
-        gc_balance: user.gc_balance,
-        sc_balance: user.sc_balance
-      });
-
-      console.log(`✅ Payment succeeded: ${paymentIntent.id}`);
-    }
-
-    // Handle payment intent payment failed
-    if (event.type === 'payment_intent.payment_failed') {
-      const paymentIntent = event.data.object as any;
-      console.warn(`❌ Payment failed: ${paymentIntent.id}`);
-    }
-
-    res.json({ received: true });
-  } catch (error: any) {
-    console.error('Webhook error:', error.message);
-    res.status(400).json({ error: `Webhook Error: ${error.message}` });
   }
 });
 
@@ -1429,51 +1174,17 @@ app.post('/api/user/profile/update', authenticate, (req: any, res) => {
   }
 });
 
-// Support Contact Endpoint
-app.post('/api/support/contact', (req: any, res) => {
-  const { name, email, subject, message } = req.body;
-
-  try {
-    // Validate inputs
-    if (!name || !email || !subject || !message) {
-      return res.status(400).json({ error: 'All fields are required' });
-    }
-
-    if (message.length < 10) {
-      return res.status(400).json({ error: 'Message must be at least 10 characters' });
-    }
-
-    // Store support ticket in database
-    db.prepare(`
-      INSERT INTO admin_notifications (type, title, content, status)
-      VALUES (?, ?, ?, ?)
-    `).run(
-      'support_ticket',
-      `Support: ${subject} - ${name}`,
-      `From: ${email}\nSubject: ${subject}\nMessage: ${message}`,
-      'pending'
-    );
-
-    console.log(`📧 Support ticket received from ${name} (${email}): ${subject}`);
-
-    res.json({ success: true, message: 'Your message has been sent' });
-  } catch (error: any) {
-    console.error('Support contact error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
 // Seed Games
 const seedGames = () => {
   const games = [
-    { name: 'Krazy Slots', type: 'slots', slug: 'krazy-slots', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/slots/400/300' },
-    { name: 'Neon Dice', type: 'dice', slug: 'neon-dice', rtp: 98.0, min_bet: 1, max_bet: 5000, thumbnail_url: 'https://picsum.photos/seed/dice/400/300' },
-    { name: 'Scratch Tickets', type: 'scratch', slug: 'scratch-tickets', rtp: 94.0, min_bet: 0.5, max_bet: 5, thumbnail_url: 'https://picsum.photos/seed/scratch/400/300' },
-    { name: 'Pull Tabs', type: 'pulltab', slug: 'pull-tabs', rtp: 94.0, min_bet: 0.5, max_bet: 5, thumbnail_url: 'https://picsum.photos/seed/pulltab/400/300' },
+    { name: 'Krazy Slots', type: 'slots', slug: 'krazy-slots', rtp: 96.5, min_bet: 1, max_bet: 1000, image_url: 'https://picsum.photos/seed/slots/400/300' },
+    { name: 'Neon Dice', type: 'dice', slug: 'neon-dice', rtp: 98.0, min_bet: 1, max_bet: 5000, image_url: 'https://picsum.photos/seed/dice/400/300' },
+    { name: 'Scratch Tickets', type: 'scratch', slug: 'scratch-tickets', rtp: 94.0, min_bet: 0.5, max_bet: 5, image_url: 'https://picsum.photos/seed/scratch/400/300' },
+    { name: 'Pull Tabs', type: 'pulltab', slug: 'pull-tabs', rtp: 94.0, min_bet: 0.5, max_bet: 5, image_url: 'https://picsum.photos/seed/pulltab/400/300' },
   ];
-
-  const insert = db.prepare('INSERT OR IGNORE INTO games (name, type, slug, rtp, min_bet, max_bet, thumbnail_url) VALUES (?, ?, ?, ?, ?, ?, ?)');
-  games.forEach(g => insert.run(g.name, g.type, g.slug, g.rtp, g.min_bet, g.max_bet, g.thumbnail_url));
+  
+  const insert = db.prepare('INSERT OR IGNORE INTO games (name, type, slug, rtp, min_bet, max_bet, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)');
+  games.forEach(g => insert.run(g.name, g.type, g.slug, g.rtp, g.min_bet, g.max_bet, g.image_url));
 };
 
 const seedAchievements = () => {
@@ -1546,16 +1257,16 @@ const seedTournaments = () => {
 
 const seedTicketTypes = () => {
   const types = [
-    { type: 'scratch', name: 'Neon Nights', odds_description: 'Scratch to reveal neon prizes!', price_sc: 1.00, top_prize_sc: 50, total_tickets: 1000, remaining_tickets: 1000, win_probability: 0.25, min_prize: 1, max_prize: 50, theme_images: JSON.stringify(['https://picsum.photos/seed/neon/800/600']) },
-    { type: 'scratch', name: 'Golden Galaxy', odds_description: 'The universe is full of gold!', price_sc: 5.00, top_prize_sc: 500, total_tickets: 500, remaining_tickets: 500, win_probability: 0.2, min_prize: 10, max_prize: 500, theme_images: JSON.stringify(['https://picsum.photos/seed/galaxy/800/600']) },
-    { type: 'pulltab', name: 'Lucky Leprechaun', odds_description: 'Pull the tabs for the pot of gold!', price_sc: 1.00, top_prize_sc: 100, total_tickets: 1000, remaining_tickets: 1000, win_probability: 0.3, min_prize: 2, max_prize: 100, theme_images: JSON.stringify(['https://picsum.photos/seed/leprechaun/800/600']) },
-    { type: 'pulltab', name: 'Cherry Blast', odds_description: 'Classic fruit machine pull tabs.', price_sc: 2.00, top_prize_sc: 200, total_tickets: 500, remaining_tickets: 500, win_probability: 0.22, min_prize: 5, max_prize: 200, theme_images: JSON.stringify(['https://picsum.photos/seed/cherry/800/600']) },
+    { type: 'scratch', name: 'Neon Nights', description: 'Scratch to reveal neon prizes!', price_sc: 1.00, theme_images: JSON.stringify(['https://picsum.photos/seed/neon/800/600']) },
+    { type: 'scratch', name: 'Golden Galaxy', description: 'The universe is full of gold!', price_sc: 5.00, theme_images: JSON.stringify(['https://picsum.photos/seed/galaxy/800/600']) },
+    { type: 'pulltab', name: 'Lucky Leprechaun', description: 'Pull the tabs for the pot of gold!', price_sc: 1.00, theme_images: JSON.stringify(['https://picsum.photos/seed/leprechaun/800/600']) },
+    { type: 'pulltab', name: 'Cherry Blast', description: 'Classic fruit machine pull tabs.', price_sc: 2.00, theme_images: JSON.stringify(['https://picsum.photos/seed/cherry/800/600']) },
   ];
 
-  const insert = db.prepare('INSERT OR IGNORE INTO ticket_types (type, name, price_sc, top_prize_sc, total_tickets, remaining_tickets, odds_description, theme_images, win_probability, min_prize, max_prize) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+  const insert = db.prepare('INSERT OR IGNORE INTO ticket_types (type, name, description, price_sc, theme_images) VALUES (?, ?, ?, ?, ?)');
   const count = db.prepare('SELECT COUNT(*) as count FROM ticket_types').get() as any;
   if (count.count === 0) {
-    types.forEach(t => insert.run(t.type, t.name, t.price_sc, t.top_prize_sc, t.total_tickets, t.remaining_tickets, t.odds_description, t.theme_images, t.win_probability, t.min_prize, t.max_prize));
+    types.forEach(t => insert.run(t.type, t.name, t.description, t.price_sc, t.theme_images));
     console.log('Ticket types seeded');
   }
 };
@@ -1771,30 +1482,19 @@ app.post('/api/games/slots/spin', authenticate, (req: any, res) => {
     const balance = currency === 'gc' ? user.gc_balance : user.sc_balance;
     if (balance < betAmount) return res.status(400).json({ error: 'Insufficient balance' });
     
-    // Enhanced RNG Logic with realistic payout distribution
+    // RNG Logic
     const random = Math.random();
-    const rtp = game.rtp / 100;
-    const isWin = random < rtp;
+    const isWin = random < (game.rtp / 100);
     let winAmount = 0;
     let multiplier = 0;
-
+    
     if (isWin) {
-      // Weighted payout distribution - more realistic
-      const payoutRandom = Math.random();
-      if (payoutRandom < 0.60) {
-        // 60% - Small wins (1.2x to 1.8x)
-        multiplier = 1.2 + Math.random() * 0.6;
-      } else if (payoutRandom < 0.85) {
-        // 25% - Medium wins (2x to 5x)
-        multiplier = 2 + Math.random() * 3;
-      } else if (payoutRandom < 0.98) {
-        // 13% - Big wins (5x to 20x)
-        multiplier = 5 + Math.random() * 15;
-      } else {
-        // 2% - Jackpot (50x+)
-        multiplier = 50 + Math.random() * 100;
-      }
-
+      // Simple multiplier logic
+      const winRandom = Math.random();
+      if (winRandom < 0.01) multiplier = 50; // Big win
+      else if (winRandom < 0.1) multiplier = 10; // Medium win
+      else multiplier = 2; // Small win
+      
       winAmount = betAmount * multiplier;
     }
     
@@ -1812,7 +1512,7 @@ app.post('/api/games/slots/spin', authenticate, (req: any, res) => {
       
       // Log result
       db.prepare('INSERT INTO game_results (player_id, game_id, bet_amount, win_amount, currency, multiplier, result_data) VALUES (?, ?, ?, ?, ?, ?, ?)')
-        .run(req.user.id, gameId, betAmount, winAmount, currency, parseFloat(multiplier.toFixed(2)), JSON.stringify({ random, isWin, reels, multiplier }));
+        .run(req.user.id, gameId, betAmount, winAmount, currency, multiplier, JSON.stringify({ random, isWin }));
         
       // Update Tournament Scores
       updateTournamentScore(req.user.id, 'krazy-slots', betAmount, winAmount, multiplier, currency);
@@ -1820,27 +1520,22 @@ app.post('/api/games/slots/spin', authenticate, (req: any, res) => {
     
     transaction();
     
-    // Pre-generate reels before response
-    const responseReels = [
-      Math.floor(Math.random() * 7),
-      Math.floor(Math.random() * 7),
-      Math.floor(Math.random() * 7)
-    ];
-
     res.json({
       isWin,
-      winAmount: parseFloat(winAmount.toFixed(2)),
-      multiplier: parseFloat(multiplier.toFixed(2)),
-      newBalance: parseFloat(newBalance.toFixed(2)),
-      reels: responseReels,
-      gc_balance: currency === 'gc' ? parseFloat(newBalance.toFixed(2)) : user.gc_balance,
-      sc_balance: currency === 'sc' ? parseFloat(newBalance.toFixed(2)) : user.sc_balance
+      winAmount,
+      multiplier,
+      newBalance,
+      reels: [
+        Math.floor(Math.random() * 7),
+        Math.floor(Math.random() * 7),
+        Math.floor(Math.random() * 7)
+      ]
     });
     
     // Notify via socket for real-time balance update
     io.to(`user-${req.user.id}`).emit('balance-update', {
-      gc_balance: currency === 'gc' ? parseFloat(newBalance.toFixed(2)) : user.gc_balance,
-      sc_balance: currency === 'sc' ? parseFloat(newBalance.toFixed(2)) : user.sc_balance
+      gc_balance: currency === 'gc' ? newBalance : user.gc_balance,
+      sc_balance: currency === 'sc' ? newBalance : user.sc_balance
     });
     
   } catch (error: any) {
@@ -1860,24 +1555,23 @@ app.post('/api/games/dice/roll', authenticate, (req: any, res) => {
     const balance = currency === 'gc' ? user.gc_balance : user.sc_balance;
     if (balance < betAmount) return res.status(400).json({ error: 'Insufficient balance' });
     
-    // Dice Logic (0-100) with proper edge calculation
+    // Dice Logic (0-100)
     const roll = Math.random() * 100;
     let isWin = false;
-
+    
     if (type === 'over') {
       isWin = roll > target;
     } else {
       isWin = roll < target;
     }
-
+    
     let multiplier = 0;
     let winAmount = 0;
-
+    
     if (isWin) {
-      // Multiplier calculation: (100 / win_chance) * 0.98 (house edge)
+      // Simple multiplier calculation: (99 / win_chance)
       const winChance = type === 'over' ? (100 - target) : target;
-      const houseEdge = 0.98; // 2% house edge
-      multiplier = (100 / winChance) * houseEdge;
+      multiplier = 99 / winChance;
       winAmount = betAmount * multiplier;
     }
     
@@ -1893,7 +1587,7 @@ app.post('/api/games/dice/roll', authenticate, (req: any, res) => {
       }
       
       db.prepare('INSERT INTO game_results (player_id, game_id, bet_amount, win_amount, currency, multiplier, result_data) VALUES (?, ?, ?, ?, ?, ?, ?)')
-        .run(req.user.id, gameId, betAmount, winAmount, currency, parseFloat(multiplier.toFixed(2)), JSON.stringify({ roll: parseFloat(roll.toFixed(2)), target, type, isWin, multiplier }));
+        .run(req.user.id, gameId, betAmount, winAmount, currency, multiplier, JSON.stringify({ roll, target, type, isWin }));
         
       // Update Tournament Scores
       updateTournamentScore(req.user.id, 'neon-dice', betAmount, winAmount, multiplier, currency);
@@ -1903,17 +1597,15 @@ app.post('/api/games/dice/roll', authenticate, (req: any, res) => {
     
     res.json({
       isWin,
-      winAmount: parseFloat(winAmount.toFixed(2)),
-      multiplier: parseFloat(multiplier.toFixed(2)),
-      newBalance: parseFloat(newBalance.toFixed(2)),
-      roll: parseFloat(roll.toFixed(2)),
-      gc_balance: currency === 'gc' ? parseFloat(newBalance.toFixed(2)) : user.gc_balance,
-      sc_balance: currency === 'sc' ? parseFloat(newBalance.toFixed(2)) : user.sc_balance
+      winAmount,
+      multiplier,
+      newBalance,
+      roll: parseFloat(roll.toFixed(2))
     });
-
+    
     io.to(`user-${req.user.id}`).emit('balance-update', {
-      gc_balance: currency === 'gc' ? parseFloat(newBalance.toFixed(2)) : user.gc_balance,
-      sc_balance: currency === 'sc' ? parseFloat(newBalance.toFixed(2)) : user.sc_balance
+      gc_balance: currency === 'gc' ? newBalance : user.gc_balance,
+      sc_balance: currency === 'sc' ? newBalance : user.sc_balance
     });
     
   } catch (error: any) {
@@ -2357,14 +2049,10 @@ app.post('/api/admin/tickets/types', authenticate, isAdmin, async (req: any, res
 
     // Use DevAi to generate theme if not provided
     if (!name) {
-      if (!ai) {
-        return res.status(503).json({ error: 'AI-powered theme generation is unavailable. Please provide custom_name and custom_description.' });
-      }
-
-      const prompt = `Generate a fun, catchy theme name and a short description for a ${type === 'scratch' ? 'Scratch-off' : 'Pull Tab'} ticket.
-      The theme should be exciting and gambling-related (e.g., space, pirates, gems, luck).
+      const prompt = `Generate a fun, catchy theme name and a short description for a ${type === 'scratch' ? 'Scratch-off' : 'Pull Tab'} ticket. 
+      The theme should be exciting and gambling-related (e.g., space, pirates, gems, luck). 
       Return JSON format: { "name": "...", "description": "..." }`;
-
+      
       const response = await ai.models.generateContent({
         model: 'gemini-3-flash-preview',
         contents: prompt,
@@ -2385,9 +2073,9 @@ app.post('/api/admin/tickets/types', authenticate, isAdmin, async (req: any, res
     ];
 
     const result = db.prepare(`
-      INSERT INTO ticket_types (type, name, odds_description, price_sc, theme_images, top_prize_sc, total_tickets, remaining_tickets, win_probability, min_prize, max_prize)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(type, name, description, price_sc, JSON.stringify(theme_images), price_sc * 50, 1000, 1000, 0.2, price_sc, price_sc * 50);
+      INSERT INTO ticket_types (type, name, description, price_sc, theme_images)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(type, name, description, price_sc, JSON.stringify(theme_images));
 
     res.json({ success: true, id: result.lastInsertRowid, name, description, theme_images });
   } catch (error: any) {
@@ -2781,7 +2469,7 @@ app.get('/api/community/boards/:slug', authenticate, (req, res) => {
   }
 });
 
-app.get('/api/community/topics/:id', authenticate, (req, res) => {
+app.get('/api/community/topics/:id', authenticate, (req: any, res) => {
   const { id } = req.params;
   try {
     const topic = db.prepare(`
@@ -3070,6 +2758,10 @@ app.post('/api/admin/ai/chat', authenticate, isAdmin, async (req: any, res) => {
 
 // Daily AI Tasks & Reports (Simulated every 24 hours)
 const runDailyAiTasks = async () => {
+  if (!ai) {
+    console.warn('Skipping daily AI tasks: AI Service unavailable.');
+    return;
+  }
   try {
     const employees = db.prepare('SELECT * FROM ai_employees').all() as any[];
     const devAi = employees.find(e => e.name === 'DevAi');
