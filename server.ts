@@ -9,6 +9,7 @@ import Database from 'better-sqlite3';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { GoogleGenAI } from "@google/genai";
+import Stripe from 'stripe';
 
 dotenv.config();
 
@@ -34,6 +35,19 @@ if (!GEMINI_API_KEY) {
 
 const JWT_SECRET = process.env.JWT_SECRET || 'coinkrazy-secret-key-123';
 const PORT = 3000;
+
+// Initialize Stripe
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+let stripe: Stripe | null = null;
+
+if (STRIPE_SECRET_KEY) {
+  stripe = new Stripe(STRIPE_SECRET_KEY, {
+    apiVersion: '2024-11-20',
+  });
+  console.log('✅ Stripe initialized successfully');
+} else {
+  console.warn('⚠️  STRIPE_SECRET_KEY not set. Payment processing will be disabled.');
+}
 
 // Database Setup
 const db = new Database('coinkrazy.db');
@@ -725,13 +739,103 @@ app.post('/api/admin/ai/game-builder/chat', authenticate, isAdmin, async (req: a
     db.prepare('UPDATE game_builder_sessions SET history = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
       .run(JSON.stringify(history), session.id);
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       sessionId: session.id,
       ...responseData
     });
   } catch (error: any) {
     console.error('Game Builder Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Deploy AI-Built Game to Production
+app.post('/api/admin/ai/game-builder/deploy', authenticate, isAdmin, async (req: any, res) => {
+  const { sessionId, gameData } = req.body;
+
+  try {
+    let sessionData: any;
+    if (sessionId) {
+      sessionData = db.prepare('SELECT history FROM game_builder_sessions WHERE id = ?').get(sessionId) as any;
+      if (!sessionData) return res.status(400).json({ error: 'Session not found' });
+    } else if (!gameData) {
+      return res.status(400).json({ error: 'Either sessionId or gameData must be provided' });
+    }
+
+    const history = sessionData ? JSON.parse(sessionData.history || '[]') : [];
+
+    // Extract final game data from AI history
+    const finalStep = history.reverse().find((h: any) => h.preview?.step === 'final' || h.preview?.step === 'ui' || h.preview);
+    const finalData = gameData || finalStep?.preview || {};
+
+    if (!finalData.title) {
+      return res.status(400).json({ error: 'Game title is required' });
+    }
+
+    // Generate game slug from title
+    const slug = finalData.title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+
+    // Check if slug already exists
+    const existingGame = db.prepare('SELECT id FROM games WHERE slug = ?').get(slug) as any;
+    if (existingGame) {
+      return res.status(400).json({ error: `Game with slug "${slug}" already exists` });
+    }
+
+    // Create the game
+    const result = db.prepare(`
+      INSERT INTO games (name, slug, type, description, thumbnail_url, rtp, min_bet, max_bet, enabled, is_featured)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
+    `).run(
+      finalData.title,
+      slug,
+      finalData.config?.type || 'slots',
+      finalData.description || '',
+      finalData.image_url || 'https://picsum.photos/seed/game/400/300',
+      finalData.config?.rtp || 95.0,
+      finalData.config?.minBet || 0.1,
+      finalData.config?.maxBet || 100.0
+    );
+
+    // Store game configuration
+    const gameId = result.lastInsertRowid;
+    if (finalData.config) {
+      db.prepare(`
+        INSERT INTO game_builder_sessions (admin_id, game_id, history)
+        VALUES (?, ?, ?)
+      `).run(req.user.id, gameId, JSON.stringify([{ config: finalData.config }]));
+    }
+
+    // Log admin action
+    db.prepare(`
+      INSERT INTO admin_notifications (type, source_id, title, content, status)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(
+      'game_ready',
+      gameId,
+      `New Game Deployed: ${finalData.title}`,
+      `Admin ${req.user.id} deployed a new game using AI Game Builder`,
+      'approved'
+    );
+
+    console.log(`✅ Game deployed: ${finalData.title} (${slug})`);
+
+    res.json({
+      success: true,
+      game: {
+        id: gameId,
+        name: finalData.title,
+        slug,
+        type: finalData.config?.type || 'slots',
+        description: finalData.description || '',
+        thumbnail_url: finalData.image_url
+      }
+    });
+  } catch (error: any) {
+    console.error('Game Deploy Error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1103,35 +1207,80 @@ app.get('/api/store/packages', authenticate, (req: any, res) => {
   }
 });
 
-// Payment verification helper (stub for real payment provider integration)
-const verifyPayment = async (paymentMethod: string, amount: number, paymentToken?: string): Promise<boolean> => {
-  // TODO: Integrate with real payment provider
-  // - Stripe: verify paymentToken with Stripe API
-  // - CashApp: verify with CashApp payment API
-  // - Google Pay: verify with Google Pay API
+// Payment verification helper - Stripe integration
+const verifyPayment = async (paymentIntentId: string): Promise<boolean> => {
+  if (!stripe) {
+    console.warn('⚠️  Stripe not initialized. Payment verification disabled.');
+    return false;
+  }
 
-  // For now, log payment attempt and approve
-  console.log(`[Payment Verification] Method: ${paymentMethod}, Amount: $${amount}`);
+  try {
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
 
-  // In production, this should:
-  // 1. Call payment provider API
-  // 2. Verify payment token/intent
-  // 3. Check for fraud
-  // 4. Return success/failure
+    console.log(`[Payment Verification] Intent: ${paymentIntentId}, Status: ${paymentIntent.status}`);
 
-  return true; // Stub: always approve for demo
+    // Check if payment was successful
+    if (paymentIntent.status === 'succeeded') {
+      return true;
+    } else if (paymentIntent.status === 'processing' || paymentIntent.status === 'requires_action') {
+      // Payment is processing, allow but should check later
+      console.log(`Payment ${paymentIntentId} is still processing`);
+      return false;
+    } else {
+      console.warn(`Payment failed: ${paymentIntent.status}`);
+      return false;
+    }
+  } catch (error: any) {
+    console.error('Payment verification error:', error.message);
+    return false;
+  }
 };
 
+// Create Payment Intent endpoint
+app.post('/api/payments/create-intent', authenticate, async (req: any, res) => {
+  const { packId } = req.body;
+
+  try {
+    if (!stripe) {
+      return res.status(503).json({ error: 'Payment processing is currently unavailable' });
+    }
+
+    const pack = db.prepare('SELECT * FROM coin_packages WHERE id = ?').get(packId) as any;
+    if (!pack) return res.status(400).json({ error: 'Invalid pack' });
+
+    // Convert amount to cents for Stripe
+    const amountInCents = Math.round(pack.price * 100);
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amountInCents,
+      currency: 'usd',
+      metadata: {
+        packId: packId.toString(),
+        userId: req.user.id.toString(),
+        gcAmount: pack.gc_amount.toString(),
+        scAmount: pack.sc_amount.toString(),
+      },
+    });
+
+    res.json({
+      clientSecret: paymentIntent.client_secret,
+      paymentIntentId: paymentIntent.id,
+    });
+  } catch (error: any) {
+    console.error('Error creating payment intent:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/store/purchase', authenticate, async (req: any, res) => {
-  const { packId, paymentMethod, paymentToken } = req.body; // paymentMethod: 'cashapp' or 'googlepay'
+  const { packId, paymentIntentId } = req.body;
 
   try {
     const pack = db.prepare('SELECT * FROM coin_packages WHERE id = ?').get(packId) as any;
     if (!pack) return res.status(400).json({ error: 'Invalid pack' });
 
-    // Verify payment with payment provider
-    // TODO: Replace with real payment verification
-    const paymentVerified = await verifyPayment(paymentMethod, pack.price, paymentToken);
+    // Verify payment with Stripe
+    const paymentVerified = await verifyPayment(paymentIntentId);
 
     if (!paymentVerified) {
       return res.status(402).json({ error: 'Payment verification failed. Please try again.' });
@@ -1142,15 +1291,15 @@ app.post('/api/store/purchase', authenticate, async (req: any, res) => {
       db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
         .run(pack.gc_amount, pack.sc_amount, req.user.id);
 
-      // Log transaction with payment method
+      // Log transaction with Stripe reference
       db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
-        .run(req.user.id, 'purchase', pack.gc_amount, pack.sc_amount, `Purchased ${pack.name} via ${paymentMethod}`);
+        .run(req.user.id, 'purchase', pack.gc_amount, pack.sc_amount, `Purchased ${pack.name} (Stripe: ${paymentIntentId})`);
     });
-    
+
     transaction();
-    
+
     const user = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
-    
+
     // Notify via socket
     io.to(`user-${req.user.id}`).emit('balance-update', {
       gc_balance: user.gc_balance,
@@ -1160,6 +1309,57 @@ app.post('/api/store/purchase', authenticate, async (req: any, res) => {
     res.json({ success: true, balances: user });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Stripe Webhook Endpoint
+app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req: any, res) => {
+  const sig = req.headers['stripe-signature'];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!stripe || !webhookSecret) {
+    return res.status(503).json({ error: 'Webhook not configured' });
+  }
+
+  try {
+    const event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+
+    // Handle payment intent succeeded
+    if (event.type === 'payment_intent.succeeded') {
+      const paymentIntent = event.data.object as any;
+      const { packId, userId, gcAmount, scAmount } = paymentIntent.metadata;
+
+      // Award coins to player
+      const transaction = db.transaction(() => {
+        db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
+          .run(parseFloat(gcAmount), parseFloat(scAmount), parseInt(userId));
+
+        db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+          .run(parseInt(userId), 'purchase', parseFloat(gcAmount), parseFloat(scAmount), `Purchased coins (Stripe: ${paymentIntent.id})`);
+      });
+
+      transaction();
+
+      // Notify user via socket
+      const user = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(parseInt(userId)) as any;
+      io.to(`user-${userId}`).emit('balance-update', {
+        gc_balance: user.gc_balance,
+        sc_balance: user.sc_balance
+      });
+
+      console.log(`✅ Payment succeeded: ${paymentIntent.id}`);
+    }
+
+    // Handle payment intent payment failed
+    if (event.type === 'payment_intent.payment_failed') {
+      const paymentIntent = event.data.object as any;
+      console.warn(`❌ Payment failed: ${paymentIntent.id}`);
+    }
+
+    res.json({ received: true });
+  } catch (error: any) {
+    console.error('Webhook error:', error.message);
+    res.status(400).json({ error: `Webhook Error: ${error.message}` });
   }
 });
 

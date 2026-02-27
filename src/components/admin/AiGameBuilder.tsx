@@ -37,8 +37,10 @@ export default function AiGameBuilder({ gameId, onClose }: AiGameBuilderProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [isDeploying, setIsDeploying] = useState(false);
   const [sessionId, setSessionId] = useState<number | null>(null);
   const [variations, setVariations] = useState<string[]>([]);
+  const [deployStatus, setDeployStatus] = useState<{ type: 'success' | 'error', message: string } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -65,10 +67,10 @@ export default function AiGameBuilder({ gameId, onClose }: AiGameBuilderProps) {
       const res = await fetch('/api/admin/ai/game-builder/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          message: messageText, 
-          sessionId, 
-          gameId 
+        body: JSON.stringify({
+          message: messageText,
+          sessionId,
+          gameId
         })
       });
 
@@ -77,7 +79,7 @@ export default function AiGameBuilder({ gameId, onClose }: AiGameBuilderProps) {
 
       setSessionId(data.sessionId);
       setVariations(data.variations || []);
-      
+
       const aiMsg: Message = {
         role: 'ai',
         content: data.text,
@@ -90,6 +92,46 @@ export default function AiGameBuilder({ gameId, onClose }: AiGameBuilderProps) {
       console.error('Builder Error:', error);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleDeploy = async () => {
+    if (!sessionId || isDeploying) return;
+
+    setIsDeploying(true);
+    setDeployStatus(null);
+
+    try {
+      const res = await fetch('/api/admin/ai/game-builder/deploy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId })
+      });
+
+      const data = await res.json();
+
+      if (res.ok) {
+        setDeployStatus({
+          type: 'success',
+          message: `Game "${data.game.name}" deployed successfully!`
+        });
+        setTimeout(() => {
+          onClose();
+        }, 2000);
+      } else {
+        setDeployStatus({
+          type: 'error',
+          message: data.error || 'Failed to deploy game'
+        });
+      }
+    } catch (error: any) {
+      console.error('Deploy Error:', error);
+      setDeployStatus({
+        type: 'error',
+        message: error.message || 'An error occurred during deployment'
+      });
+    } finally {
+      setIsDeploying(false);
     }
   };
 
@@ -356,10 +398,37 @@ export default function AiGameBuilder({ gameId, onClose }: AiGameBuilderProps) {
           </div>
 
           {currentPreview?.step === 'final' && (
-            <div className="p-6 bg-slate-900/50 border-t border-white/5">
-              <Button className="w-full bg-emerald-600 hover:bg-emerald-500 text-white gap-2 h-12 rounded-2xl shadow-lg shadow-emerald-900/20">
-                <CheckCircle2 className="w-5 h-5" />
-                Deploy Game to Production
+            <div className="p-6 bg-slate-900/50 border-t border-white/5 space-y-3">
+              {deployStatus && (
+                <motion.div
+                  initial={{ opacity: 0, y: -10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className={cn(
+                    "p-3 rounded-xl text-sm font-medium",
+                    deployStatus.type === 'success'
+                      ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30"
+                      : "bg-red-500/20 text-red-300 border border-red-500/30"
+                  )}
+                >
+                  {deployStatus.message}
+                </motion.div>
+              )}
+              <Button
+                onClick={handleDeploy}
+                disabled={isDeploying}
+                className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white gap-2 h-12 rounded-2xl shadow-lg shadow-emerald-900/20"
+              >
+                {isDeploying ? (
+                  <>
+                    <RefreshCw className="w-5 h-5 animate-spin" />
+                    Deploying...
+                  </>
+                ) : (
+                  <>
+                    <CheckCircle2 className="w-5 h-5" />
+                    Deploy Game to Production
+                  </>
+                )}
               </Button>
             </div>
           )}
