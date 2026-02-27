@@ -14,6 +14,7 @@ import AdminPanel from './pages/AdminPanel';
 import CommunityPage from './pages/CommunityPage';
 import ScratchTicketsPage from './pages/ScratchTicketsPage';
 import PullTabsPage from './pages/PullTabsPage';
+import Support from './pages/Support';
 
 import { AuthProvider } from './contexts/AuthContext';
 import Login from './pages/Login';
@@ -42,7 +43,7 @@ export default function App() {
               <Route path="games/scratch-tickets" element={<ScratchTicketsPage />} />
               <Route path="games/pull-tabs" element={<PullTabsPage />} />
               <Route path="admin" element={<AdminPanel />} />
-              <Route path="support" element={<div className="text-white">Support Page (Coming Soon)</div>} />
+              <Route path="support" element={<Support />} />
             </Route>
           </Routes>
         </BrowserRouter>

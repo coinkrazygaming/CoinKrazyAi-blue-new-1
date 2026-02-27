@@ -1429,6 +1429,40 @@ app.post('/api/user/profile/update', authenticate, (req: any, res) => {
   }
 });
 
+// Support Contact Endpoint
+app.post('/api/support/contact', (req: any, res) => {
+  const { name, email, subject, message } = req.body;
+
+  try {
+    // Validate inputs
+    if (!name || !email || !subject || !message) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+
+    if (message.length < 10) {
+      return res.status(400).json({ error: 'Message must be at least 10 characters' });
+    }
+
+    // Store support ticket in database
+    db.prepare(`
+      INSERT INTO admin_notifications (type, title, content, status)
+      VALUES (?, ?, ?, ?)
+    `).run(
+      'support_ticket',
+      `Support: ${subject} - ${name}`,
+      `From: ${email}\nSubject: ${subject}\nMessage: ${message}`,
+      'pending'
+    );
+
+    console.log(`📧 Support ticket received from ${name} (${email}): ${subject}`);
+
+    res.json({ success: true, message: 'Your message has been sent' });
+  } catch (error: any) {
+    console.error('Support contact error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Seed Games
 const seedGames = () => {
   const games = [

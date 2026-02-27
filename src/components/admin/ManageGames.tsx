@@ -1,31 +1,45 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { 
-  Gamepad2, 
-  Plus, 
-  Search, 
-  Filter, 
-  Edit2, 
-  Trash2, 
+import {
+  Gamepad2,
+  Plus,
+  Search,
+  Filter,
+  Edit2,
+  Trash2,
   RefreshCw,
   Eye,
   ToggleLeft,
   ToggleRight,
   MoreVertical,
-  Wand2
+  Wand2,
+  X,
+  Save
 } from 'lucide-react';
 import { Card, CardContent, CardHeader } from '../ui/Card';
 import { Button } from '../ui/Button';
 import { cn } from '../../lib/utils';
+import { motion, AnimatePresence } from 'framer-motion';
 
 interface ManageGamesProps {
   onOpenBuilder: (gameId?: number) => void;
+}
+
+interface GameEditForm {
+  id?: number;
+  name: string;
+  description: string;
+  rtp: number;
+  min_bet: number;
+  max_bet: number;
 }
 
 export default function ManageGames({ onOpenBuilder }: ManageGamesProps) {
   const queryClient = useQueryClient();
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState('all');
+  const [editingGame, setEditingGame] = useState<GameEditForm | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
 
   const { data, isLoading } = useQuery({
     queryKey: ['admin-games'],
@@ -62,6 +76,43 @@ export default function ManageGames({ onOpenBuilder }: ManageGamesProps) {
       queryClient.invalidateQueries({ queryKey: ['admin-games'] });
     }
   });
+
+  const editMutation = useMutation({
+    mutationFn: async (game: GameEditForm) => {
+      const res = await fetch(`/api/admin/games/${game.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(game)
+      });
+      if (!res.ok) throw new Error('Update failed');
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['admin-games'] });
+      setEditingGame(null);
+    }
+  });
+
+  const handleEditGame = (game: any) => {
+    setEditingGame({
+      id: game.id,
+      name: game.name,
+      description: game.description || '',
+      rtp: game.rtp,
+      min_bet: game.min_bet,
+      max_bet: game.max_bet
+    });
+  };
+
+  const handleSaveGame = async () => {
+    if (!editingGame || !editingGame.name.trim()) return;
+    setIsSaving(true);
+    try {
+      await editMutation.mutateAsync(editingGame);
+    } finally {
+      setIsSaving(false);
+    }
+  };
 
   if (isLoading) return <div className="text-white">Loading games...</div>;
 
@@ -204,25 +255,26 @@ export default function ManageGames({ onOpenBuilder }: ManageGamesProps) {
               </div>
 
               <div className="flex gap-2">
-                <Button 
-                  variant="outline" 
-                  size="sm" 
+                <Button
+                  variant="outline"
+                  size="sm"
                   className="flex-1 border-white/10 text-white gap-2 text-xs"
                   onClick={() => onOpenBuilder(game.id)}
                 >
                   <RefreshCw className="w-3 h-3 text-purple-400" />
                   Rework AI
                 </Button>
-                <Button 
-                  variant="outline" 
-                  size="sm" 
-                  className="border-white/10 text-white p-2"
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="border-white/10 text-white p-2 hover:bg-white/5"
+                  onClick={() => handleEditGame(game)}
                 >
                   <Edit2 className="w-3 h-3" />
                 </Button>
-                <Button 
-                  variant="outline" 
-                  size="sm" 
+                <Button
+                  variant="outline"
+                  size="sm"
                   className="border-red-500/20 text-red-400 p-2 hover:bg-red-500/10"
                   onClick={() => deleteMutation.mutate(game.id)}
                 >
@@ -233,6 +285,122 @@ export default function ManageGames({ onOpenBuilder }: ManageGamesProps) {
           </Card>
         ))}
       </div>
+
+      {/* Edit Game Modal */}
+      <AnimatePresence>
+        {editingGame && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+          >
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="bg-slate-900 border border-white/10 rounded-2xl w-full max-w-lg shadow-2xl"
+            >
+              <div className="flex items-center justify-between p-6 border-b border-white/10">
+                <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                  <Edit2 className="w-5 h-5 text-purple-400" />
+                  Edit Game
+                </h2>
+                <button
+                  onClick={() => setEditingGame(null)}
+                  className="p-2 hover:bg-white/5 rounded-lg transition-colors"
+                >
+                  <X className="w-5 h-5 text-slate-400" />
+                </button>
+              </div>
+
+              <div className="p-6 space-y-5">
+                <div>
+                  <label className="block text-sm font-bold text-white mb-2">Game Name</label>
+                  <input
+                    type="text"
+                    value={editingGame.name}
+                    onChange={(e) => setEditingGame({ ...editingGame, name: e.target.value })}
+                    className="w-full bg-slate-950 border border-white/10 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-purple-500/50 transition-colors"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-bold text-white mb-2">Description</label>
+                  <textarea
+                    value={editingGame.description}
+                    onChange={(e) => setEditingGame({ ...editingGame, description: e.target.value })}
+                    rows={3}
+                    className="w-full bg-slate-950 border border-white/10 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-purple-500/50 transition-colors resize-none"
+                  />
+                </div>
+
+                <div className="grid grid-cols-3 gap-4">
+                  <div>
+                    <label className="block text-sm font-bold text-white mb-2">RTP %</label>
+                    <input
+                      type="number"
+                      min="1"
+                      max="100"
+                      step="0.1"
+                      value={editingGame.rtp}
+                      onChange={(e) => setEditingGame({ ...editingGame, rtp: parseFloat(e.target.value) })}
+                      className="w-full bg-slate-950 border border-white/10 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-purple-500/50 transition-colors"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-bold text-white mb-2">Min Bet</label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.1"
+                      value={editingGame.min_bet}
+                      onChange={(e) => setEditingGame({ ...editingGame, min_bet: parseFloat(e.target.value) })}
+                      className="w-full bg-slate-950 border border-white/10 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-purple-500/50 transition-colors"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-bold text-white mb-2">Max Bet</label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.1"
+                      value={editingGame.max_bet}
+                      onChange={(e) => setEditingGame({ ...editingGame, max_bet: parseFloat(e.target.value) })}
+                      className="w-full bg-slate-950 border border-white/10 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-purple-500/50 transition-colors"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex gap-3 p-6 border-t border-white/10">
+                <Button
+                  variant="outline"
+                  className="flex-1 border-white/10 text-white"
+                  onClick={() => setEditingGame(null)}
+                  disabled={isSaving}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  className="flex-1 bg-purple-600 hover:bg-purple-500 text-white gap-2"
+                  onClick={handleSaveGame}
+                  disabled={isSaving}
+                >
+                  {isSaving ? (
+                    <>Saving...</>
+                  ) : (
+                    <>
+                      <Save className="w-4 h-4" />
+                      Save Changes
+                    </>
+                  )}
+                </Button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
