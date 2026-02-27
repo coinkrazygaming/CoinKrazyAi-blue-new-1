@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { 
-  Users, 
-  Settings, 
-  DollarSign, 
+import {
+  Users,
+  Settings,
+  DollarSign,
   Activity,
   ShieldAlert,
   Save,
@@ -25,7 +25,8 @@ import {
   Bell,
   Gamepad2,
   Megaphone,
-  HelpCircle
+  HelpCircle,
+  Gift
 } from 'lucide-react';
 import { Button } from '../components/ui/Button';
 import { Card, CardContent, CardHeader } from '../components/ui/Card';
