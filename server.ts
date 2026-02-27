@@ -67,6 +67,7 @@ db.exec(`
     type TEXT NOT NULL, -- slots, crash, scratch, pulltab
     description TEXT,
     thumbnail_url TEXT,
+    image_url TEXT,
     enabled INTEGER DEFAULT 1,
     rtp REAL DEFAULT 95.0,
     min_bet REAL DEFAULT 0.1,
@@ -192,6 +193,7 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     type TEXT NOT NULL, -- scratch, pulltab
+    description TEXT,
     price_sc REAL NOT NULL,
     top_prize_sc REAL NOT NULL,
     total_tickets INTEGER NOT NULL,
