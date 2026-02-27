@@ -53,10 +53,12 @@ export const PlayerBonuses: React.FC = () => {
       ]);
       const availData = await availRes.json();
       const myData = await myRes.json();
-      setAvailableBonuses(availData.bonuses);
-      setMyBonuses(myData.bonuses);
+      setAvailableBonuses(availData?.bonuses || []);
+      setMyBonuses(myData?.bonuses || []);
     } catch (error) {
       console.error('Error fetching bonuses:', error);
+      setAvailableBonuses([]);
+      setMyBonuses([]);
     } finally {
       setLoading(false);
     }
