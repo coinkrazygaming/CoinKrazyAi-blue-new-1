@@ -57,8 +57,14 @@ db.exec(`
     referred_by INTEGER,
     last_login DATETIME DEFAULT CURRENT_TIMESTAMP,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    kyc_status TEXT DEFAULT 'unverified'
+    kyc_status TEXT DEFAULT 'unverified',
+    last_bonus_claim DATETIME,
+    login_streak INTEGER DEFAULT 0
   );
+
+  -- Ensure columns exist for existing databases
+  ALTER TABLE players ADD COLUMN last_bonus_claim DATETIME;
+  ALTER TABLE players ADD COLUMN login_streak INTEGER DEFAULT 0;
 
   CREATE TABLE IF NOT EXISTS games (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,7 +73,6 @@ db.exec(`
     type TEXT NOT NULL, -- slots, crash, scratch, pulltab
     description TEXT,
     thumbnail_url TEXT,
-    image_url TEXT,
     enabled INTEGER DEFAULT 1,
     rtp REAL DEFAULT 95.0,
     min_bet REAL DEFAULT 0.1,
@@ -193,7 +198,6 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     type TEXT NOT NULL, -- scratch, pulltab
-    description TEXT,
     price_sc REAL NOT NULL,
     top_prize_sc REAL NOT NULL,
     total_tickets INTEGER NOT NULL,
@@ -326,6 +330,31 @@ db.exec(`
     PRIMARY KEY(player_id, achievement_id),
     FOREIGN KEY(player_id) REFERENCES players(id),
     FOREIGN KEY(achievement_id) REFERENCES achievements(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS challenges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    requirement_type TEXT NOT NULL, -- 'win_streak', 'total_wager', 'specific_game_win', 'multiplier'
+    requirement_value REAL NOT NULL,
+    reward_gc REAL DEFAULT 0,
+    reward_sc REAL DEFAULT 0,
+    difficulty INTEGER DEFAULT 1, -- 1 to 5
+    expires_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS player_challenges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_id INTEGER NOT NULL,
+    challenge_id INTEGER NOT NULL,
+    progress REAL DEFAULT 0,
+    status TEXT DEFAULT 'active', -- active, completed, failed
+    started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME,
+    FOREIGN KEY(player_id) REFERENCES players(id),
+    FOREIGN KEY(challenge_id) REFERENCES challenges(id)
   );
 
   CREATE TABLE IF NOT EXISTS bonuses (
@@ -883,6 +912,65 @@ const moderateContent = async (userId: number, content: string, type: 'chat' | '
   }
 };
 
+// Update Challenge Progress
+const updateChallengeProgress = (userId: number, gameId: number, betAmount: number, winAmount: number, currency: string, multiplier: number) => {
+  try {
+    const activeChallenges = db.prepare(`
+      SELECT pc.id as player_challenge_id, c.*, pc.progress 
+      FROM player_challenges pc
+      JOIN challenges c ON pc.challenge_id = c.id
+      WHERE pc.player_id = ? AND pc.status = 'active'
+    `).all(userId) as any[];
+
+    for (const challenge of activeChallenges) {
+      let newProgress = challenge.progress;
+      let completed = false;
+
+      if (challenge.requirement_type === 'total_wager') {
+        newProgress += betAmount;
+        if (newProgress >= challenge.requirement_value) completed = true;
+      } else if (challenge.requirement_type === 'specific_game_win' && winAmount > 0) {
+        newProgress += 1;
+        if (newProgress >= challenge.requirement_value) completed = true;
+      } else if (challenge.requirement_type === 'multiplier' && multiplier >= challenge.requirement_value) {
+        completed = true;
+      }
+
+      if (completed) {
+        db.transaction(() => {
+          db.prepare('UPDATE player_challenges SET progress = ?, status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?')
+            .run(challenge.requirement_value, 'completed', challenge.player_challenge_id);
+          
+          // Award rewards
+          if (challenge.reward_gc > 0 || challenge.reward_sc > 0) {
+            db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
+              .run(challenge.reward_gc, challenge.reward_sc, userId);
+            
+            db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+              .run(userId, 'bonus', challenge.reward_gc, challenge.reward_sc, `Challenge Completed: ${challenge.title}`);
+            
+            // Notify via socket
+            const user = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(userId) as any;
+            io.to(`user-${userId}`).emit('balance-update', {
+              gc_balance: user.gc_balance,
+              sc_balance: user.sc_balance
+            });
+            io.to(`user-${userId}`).emit('notification', {
+              title: 'Challenge Completed!',
+              message: `You've completed "${challenge.title}" and earned ${challenge.reward_gc} GC and ${challenge.reward_sc} SC!`,
+              type: 'success'
+            });
+          }
+        })();
+      } else if (newProgress !== challenge.progress) {
+        db.prepare('UPDATE player_challenges SET progress = ? WHERE id = ?').run(newProgress, challenge.player_challenge_id);
+      }
+    }
+  } catch (error) {
+    console.error('Challenge Progress Update Error:', error);
+  }
+};
+
 // API Routes
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -1001,7 +1089,7 @@ app.get('/api/auth/me', (req, res) => {
   
   try {
     const decoded = jwt.verify(token, JWT_SECRET) as any;
-    const user = db.prepare('SELECT id, email, username, role, gc_balance, sc_balance, avatar_url, vip_status, referral_code, kyc_status, cashapp_tag FROM players WHERE id = ?').get(decoded.id) as any;
+    const user = db.prepare('SELECT id, email, username, role, gc_balance, sc_balance, avatar_url, vip_status, referral_code, kyc_status, cashapp_tag, last_bonus_claim, login_streak FROM players WHERE id = ?').get(decoded.id) as any;
     res.json({ user });
   } catch (error) {
     res.status(401).json({ error: 'Invalid token' });
@@ -1016,10 +1104,13 @@ app.post('/api/auth/logout', (req, res) => {
 // Wallet Endpoints
 app.post('/api/auth/daily-bonus', authenticate, (req: any, res) => {
   try {
-    const user = db.prepare('SELECT last_bonus_claim FROM players WHERE id = ?').get(req.user.id) as any;
+    const user = db.prepare('SELECT last_bonus_claim, login_streak, gc_balance, sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
     const now = new Date();
     const lastClaim = user.last_bonus_claim ? new Date(user.last_bonus_claim) : null;
     
+    // Check if already claimed today (within 24h)
+    // Actually, let's make it "once per calendar day" or "24h since last claim"
+    // The user said "each day", usually 24h is safer to prevent double claiming if they log in at 11:59pm and 12:01am.
     if (lastClaim && (now.getTime() - lastClaim.getTime()) < 24 * 60 * 60 * 1000) {
       const nextClaim = new Date(lastClaim.getTime() + 24 * 60 * 60 * 1000);
       return res.status(400).json({ 
@@ -1028,27 +1119,59 @@ app.post('/api/auth/daily-bonus', authenticate, (req: any, res) => {
       });
     }
     
-    const bonusAmount = 5000; // 5000 GC
+    let newStreak = 1;
+    if (lastClaim) {
+      const diffHours = (now.getTime() - lastClaim.getTime()) / (1000 * 60 * 60);
+      if (diffHours < 48) {
+        // Claimed yesterday (between 24 and 48 hours ago)
+        newStreak = (user.login_streak || 0) + 1;
+      } else {
+        // Missed a day
+        newStreak = 1;
+      }
+    }
+
+    // Calculate rewards
+    // Base: 10 GC, 1 SC
+    // Streak: +10 GC per day of streak (up to 7)
+    // Day 7+: 100 GC, 5 SC
+    let rewardGc = 10 + (Math.min(newStreak, 7) - 1) * 10;
+    let rewardSc = 1 + (Math.min(newStreak, 7) - 1) * 0.5;
+    
+    if (newStreak >= 7) {
+      rewardGc = 100;
+      rewardSc = 5;
+    }
     
     db.transaction(() => {
-      db.prepare('UPDATE players SET gc_balance = gc_balance + ?, last_bonus_claim = ? WHERE id = ?')
-        .run(bonusAmount, now.toISOString(), req.user.id);
+      db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ?, last_bonus_claim = ?, login_streak = ? WHERE id = ?')
+        .run(rewardGc, rewardSc, now.toISOString(), newStreak, req.user.id);
       
-      db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, description) VALUES (?, ?, ?, ?)')
-        .run(req.user.id, 'Bonus', bonusAmount, 'Daily Login Bonus');
+      db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+        .run(req.user.id, 'Bonus', rewardGc, rewardSc, `Daily Login Bonus (Day ${newStreak} Streak)`);
     })();
+    
+    const updatedUser = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
     
     res.json({ 
       message: 'Bonus claimed successfully!', 
-      amount: bonusAmount,
-      newBalance: db.prepare('SELECT gc_balance FROM players WHERE id = ?').get(req.user.id).gc_balance
+      rewardGc,
+      rewardSc,
+      streak: newStreak,
+      newGcBalance: updatedUser.gc_balance,
+      newScBalance: updatedUser.sc_balance
     });
 
     // Notify via socket
-    const updatedUser = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
     io.to(`user-${req.user.id}`).emit('balance-update', {
       gc_balance: updatedUser.gc_balance,
       sc_balance: updatedUser.sc_balance
+    });
+
+    io.to(`user-${req.user.id}`).emit('notification', {
+      title: 'Daily Bonus Claimed!',
+      message: `You received ${rewardGc} GC and ${rewardSc} SC. Streak: ${newStreak} days!`,
+      type: 'success'
     });
     
   } catch (error: any) {
@@ -1183,6 +1306,7 @@ const seedGames = () => {
     { name: 'Neon Dice', type: 'dice', slug: 'neon-dice', rtp: 98.0, min_bet: 1, max_bet: 5000, image_url: 'https://picsum.photos/seed/dice/400/300' },
     { name: 'Scratch Tickets', type: 'scratch', slug: 'scratch-tickets', rtp: 94.0, min_bet: 0.5, max_bet: 5, image_url: 'https://picsum.photos/seed/scratch/400/300' },
     { name: 'Pull Tabs', type: 'pulltab', slug: 'pull-tabs', rtp: 94.0, min_bet: 0.5, max_bet: 5, image_url: 'https://picsum.photos/seed/pulltab/400/300' },
+    { name: 'Krazy Crash', type: 'crash', slug: 'krazy-crash', rtp: 97.0, min_bet: 1, max_bet: 1000, image_url: 'https://picsum.photos/seed/crash/400/300' },
   ];
   
   const insert = db.prepare('INSERT OR IGNORE INTO games (name, type, slug, rtp, min_bet, max_bet, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)');
@@ -1518,6 +1642,9 @@ app.post('/api/games/slots/spin', authenticate, (req: any, res) => {
         
       // Update Tournament Scores
       updateTournamentScore(req.user.id, 'krazy-slots', betAmount, winAmount, multiplier, currency);
+      
+      // Update Challenge Progress
+      updateChallengeProgress(req.user.id, gameId, betAmount, winAmount, currency, multiplier);
     });
     
     transaction();
@@ -1535,6 +1662,68 @@ app.post('/api/games/slots/spin', authenticate, (req: any, res) => {
     });
     
     // Notify via socket for real-time balance update
+    io.to(`user-${req.user.id}`).emit('balance-update', {
+      gc_balance: currency === 'gc' ? newBalance : user.gc_balance,
+      sc_balance: currency === 'sc' ? newBalance : user.sc_balance
+    });
+    
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/games/crash/play', authenticate, (req: any, res) => {
+  const { gameId, betAmount, currency, autoCashout } = req.body;
+  
+  try {
+    const user = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
+    const game = db.prepare('SELECT * FROM games WHERE id = ?').get(gameId) as any;
+    
+    if (!game) return res.status(404).json({ error: 'Game not found' });
+    
+    const balance = currency === 'gc' ? user.gc_balance : user.sc_balance;
+    if (balance < betAmount) return res.status(400).json({ error: 'Insufficient balance' });
+    
+    // Crash Logic: 1 / (1 - X) where X is 0 to 0.99
+    // House edge: if X < 0.03, crash at 1.00
+    const random = Math.random();
+    let crashPoint = 1.0;
+    
+    if (random > 0.03) {
+      crashPoint = 0.99 / (1 - Math.random());
+    }
+    
+    const multiplier = Math.min(crashPoint, autoCashout || 1000);
+    const isWin = multiplier < crashPoint;
+    const winAmount = isWin ? betAmount * multiplier : 0;
+    
+    const newBalance = balance - betAmount + winAmount;
+    
+    const transaction = db.transaction(() => {
+      if (currency === 'gc') {
+        db.prepare('UPDATE players SET gc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
+          .run(newBalance, betAmount, req.user.id);
+      } else {
+        db.prepare('UPDATE players SET sc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
+          .run(newBalance, betAmount, req.user.id);
+      }
+      
+      db.prepare('INSERT INTO game_results (player_id, game_id, bet_amount, win_amount, currency, multiplier, result_data) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(req.user.id, gameId, betAmount, winAmount, currency, isWin ? multiplier : 0, JSON.stringify({ crashPoint, autoCashout, isWin }));
+      
+      updateChallengeProgress(req.user.id, gameId, betAmount, winAmount, currency, isWin ? multiplier : 0);
+    });
+    
+    transaction();
+    
+    res.json({
+      isWin,
+      winAmount,
+      multiplier: isWin ? multiplier : 0,
+      crashPoint,
+      newBalance
+    });
+    
     io.to(`user-${req.user.id}`).emit('balance-update', {
       gc_balance: currency === 'gc' ? newBalance : user.gc_balance,
       sc_balance: currency === 'sc' ? newBalance : user.sc_balance
@@ -1593,6 +1782,9 @@ app.post('/api/games/dice/roll', authenticate, (req: any, res) => {
         
       // Update Tournament Scores
       updateTournamentScore(req.user.id, 'neon-dice', betAmount, winAmount, multiplier, currency);
+      
+      // Update Challenge Progress
+      updateChallengeProgress(req.user.id, gameId, betAmount, winAmount, currency, multiplier);
     });
     
     transaction();
@@ -1615,6 +1807,115 @@ app.post('/api/games/dice/roll', authenticate, (req: any, res) => {
   }
 });
 
+// AI Challenges Endpoint
+app.get('/api/ai/challenges', authenticate, async (req: any, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // Check for active challenges
+    const activeChallenges = db.prepare(`
+      SELECT c.*, pc.progress, pc.status 
+      FROM player_challenges pc
+      JOIN challenges c ON pc.challenge_id = c.id
+      WHERE pc.player_id = ? AND pc.status = 'active'
+    `).all(userId);
+
+    if (activeChallenges.length > 0) {
+      return res.json({ challenges: activeChallenges });
+    }
+
+    // Generate new challenges if none active
+    const user = db.prepare('SELECT * FROM players WHERE id = ?').get(userId) as any;
+    const recentWins = db.prepare('SELECT * FROM game_results WHERE player_id = ? ORDER BY created_at DESC LIMIT 10').all(userId);
+
+    const prompt = `You are LuckyAI, the personal gaming assistant for PlayCoinKrazy.com.
+    User Profile: ${JSON.stringify({ username: user.username, vip_status: user.vip_status, total_wagered: user.total_wagered })}
+    Recent Wins: ${JSON.stringify(recentWins)}
+    
+    Create 3 unique, personalized game challenges for this user. 
+    Challenges should adapt to their skill level (total wagered).
+    
+    Requirement Types:
+    - 'win_streak': Win X games in a row
+    - 'total_wager': Wager a total of X GC/SC
+    - 'specific_game_win': Win X times on a specific game
+    - 'multiplier': Get a win multiplier of at least X
+    
+    Difficulty: 1 (Easy) to 5 (Hard).
+    Rewards: 
+    - GC: 1000 to 50000
+    - SC: 0.1 to 10.0 (only for higher difficulty)
+    
+    Return a JSON array of objects with:
+    - title: Catchy title
+    - description: Clear explanation
+    - requirement_type: One of the types above
+    - requirement_value: The X value
+    - reward_gc: GC reward
+    - reward_sc: SC reward
+    - difficulty: 1-5
+    - expires_in_hours: 24 to 72
+    `;
+
+    if (!ai) {
+      // Fallback
+      const fallbackChallenges = [
+        { title: 'Slot Starter', description: 'Win 5 times on Krazy Slots', requirement_type: 'specific_game_win', requirement_value: 5, reward_gc: 1000, reward_sc: 0, difficulty: 1, expires_in_hours: 24 },
+        { title: 'High Roller Lite', description: 'Wager 5000 GC total', requirement_type: 'total_wager', requirement_value: 5000, reward_gc: 2500, reward_sc: 0, difficulty: 2, expires_in_hours: 48 }
+      ];
+      
+      const transaction = db.transaction(() => {
+        fallbackChallenges.forEach(c => {
+          const expiresAt = new Date(Date.now() + c.expires_in_hours * 60 * 60 * 1000).toISOString();
+          const result = db.prepare('INSERT INTO challenges (title, description, requirement_type, requirement_value, reward_gc, reward_sc, difficulty, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+            .run(c.title, c.description, c.requirement_type, c.requirement_value, c.reward_gc, c.reward_sc, c.difficulty, expiresAt);
+          db.prepare('INSERT INTO player_challenges (player_id, challenge_id) VALUES (?, ?)').run(userId, result.lastInsertRowid);
+        });
+      });
+      transaction();
+      
+      const newChallenges = db.prepare(`
+        SELECT c.*, pc.progress, pc.status 
+        FROM player_challenges pc
+        JOIN challenges c ON pc.challenge_id = c.id
+        WHERE pc.player_id = ? AND pc.status = 'active'
+      `).all(userId);
+      
+      return res.json({ challenges: newChallenges });
+    }
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: prompt,
+      config: { responseMimeType: 'application/json' }
+    });
+
+    const challenges = JSON.parse(response.text || '[]');
+    
+    const transaction = db.transaction(() => {
+      challenges.forEach((c: any) => {
+        const expiresAt = new Date(Date.now() + (c.expires_in_hours || 24) * 60 * 60 * 1000).toISOString();
+        const result = db.prepare('INSERT INTO challenges (title, description, requirement_type, requirement_value, reward_gc, reward_sc, difficulty, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(c.title, c.description, c.requirement_type, c.requirement_value, c.reward_gc, c.reward_sc, c.difficulty, expiresAt);
+        db.prepare('INSERT INTO player_challenges (player_id, challenge_id) VALUES (?, ?)').run(userId, result.lastInsertRowid);
+      });
+    });
+    transaction();
+
+    const newChallenges = db.prepare(`
+      SELECT c.*, pc.progress, pc.status 
+      FROM player_challenges pc
+      JOIN challenges c ON pc.challenge_id = c.id
+      WHERE pc.player_id = ? AND pc.status = 'active'
+    `).all(userId);
+
+    res.json({ challenges: newChallenges });
+  } catch (error: any) {
+    console.error('AI Challenges Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/stats/wagered-history', authenticate, (req: any, res) => {
   try {
     const history = db.prepare(`
@@ -1631,7 +1932,57 @@ app.get('/api/stats/wagered-history', authenticate, (req: any, res) => {
   }
 });
 
-// Social OAuth Endpoints
+// Social Activity Feed Endpoint
+app.get('/api/social/activity', (req, res) => {
+  try {
+    const activity = db.prepare(`
+      SELECT p.username, p.avatar_url, gr.game_id, gr.win_amount, gr.currency_type, gr.created_at
+      FROM game_results gr
+      JOIN players p ON gr.player_id = p.id
+      WHERE gr.win_amount > 0
+      ORDER BY gr.created_at DESC
+      LIMIT 20
+    `).all();
+    res.json({ activity });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Global Chat Endpoints
+const chatMessages: any[] = [];
+app.get('/api/chat/messages', (req, res) => {
+  res.json({ messages: chatMessages.slice(-50) });
+});
+
+app.post('/api/chat/messages', authenticate, async (req: any, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message required' });
+
+  try {
+    // Moderate content
+    const moderation = await moderateContent(req.user.id, message, 'chat');
+    if (!moderation.safe) {
+      return res.status(400).json({ error: 'Message blocked by SecurityAi: ' + moderation.reason });
+    }
+
+    const newMessage = {
+      id: Date.now(),
+      userId: req.user.id,
+      username: req.user.username,
+      content: message,
+      timestamp: new Date().toISOString()
+    };
+    
+    chatMessages.push(newMessage);
+    if (chatMessages.length > 100) chatMessages.shift();
+
+    io.emit('new-chat-message', newMessage);
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
 app.get('/api/auth/social/url/:platform', authenticate, (req: any, res) => {
   const { platform } = req.params;
   const redirectUri = `${process.env.APP_URL || 'http://localhost:3000'}/auth/social/callback/${platform}`;
@@ -2437,6 +2788,92 @@ app.post('/api/bonuses/claim', authenticate, (req: any, res) => {
     res.json({ success: true });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// AI Recommendations Endpoint
+app.get('/api/ai/recommendations', authenticate, async (req: any, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // Get user profile for context
+    const user = db.prepare('SELECT username, vip_status, total_wagered, gc_balance, sc_balance FROM players WHERE id = ?').get(userId) as any;
+
+    // Get user's detailed play history including wager amounts and win/loss
+    const history = db.prepare(`
+      SELECT 
+        g.name, 
+        g.type, 
+        COUNT(*) as play_count,
+        SUM(gr.bet_amount) as total_wagered,
+        SUM(gr.win_amount) as total_won,
+        (SUM(gr.win_amount) - SUM(gr.bet_amount)) as net_profit
+      FROM game_results gr
+      JOIN games g ON gr.game_id = g.id
+      WHERE gr.player_id = ?
+      GROUP BY g.id
+      ORDER BY play_count DESC
+      LIMIT 10
+    `).all(userId);
+
+    // Get all available games
+    const allGames = db.prepare('SELECT * FROM games WHERE enabled = 1').all();
+
+    if (!ai) {
+      // Fallback if no AI key
+      return res.json({
+        games: allGames.slice(0, 3).map(g => ({
+          ...g,
+          match_score: 85 + Math.floor(Math.random() * 10),
+          reason: "Popular among players like you"
+        }))
+      });
+    }
+
+    const model = "gemini-3-flash-preview";
+
+    const prompt = `
+      You are LuckyAI, the personal gaming assistant for PlayCoinKrazy.com.
+      Analyze the following user data to provide 3 personalized game recommendations.
+      
+      User Profile: ${JSON.stringify(user)}
+      Detailed Play History (Last 10 unique games): ${JSON.stringify(history)}
+      Available Games Catalog: ${JSON.stringify(allGames.map((g: any) => ({ id: g.id, name: g.name, type: g.type, rtp: g.rtp })))}
+      
+      Instructions:
+      1. Consider their favorite game types (based on play_count).
+      2. Consider their wagering style (average bet size derived from total_wagered / play_count).
+      3. Consider their recent luck (net_profit). If they are on a losing streak, maybe suggest a higher RTP game.
+      4. Suggest games they HAVEN'T played much or at all if they fit their profile.
+      
+      Return a JSON array of objects with:
+      - id: game id
+      - match_score: percentage (80-99)
+      - reason: short catchy reason why (e.g., "Since you enjoy high-stakes slots, this new neon theme is perfect for you!")
+    `;
+
+    const response = await ai.models.generateContent({
+      model,
+      contents: prompt,
+      config: { responseMimeType: "application/json" }
+    });
+
+    const recommendations = JSON.parse(response.text || '[]');
+    
+    const enrichedRecommendations = recommendations.map((rec: any) => {
+      const game = allGames.find((g: any) => g.id === rec.id);
+      if (!game) return null;
+      return {
+        ...game,
+        match_score: rec.match_score,
+        reason: rec.reason
+      };
+    }).filter(Boolean);
+
+    res.json({ games: enrichedRecommendations });
+  } catch (error) {
+    console.error('AI Recommendations Error:', error);
+    res.status(500).json({ error: 'Failed to generate recommendations' });
   }
 });
 

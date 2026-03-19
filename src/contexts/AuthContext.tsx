@@ -10,6 +10,8 @@ interface User {
   vip_status?: string;
   avatar_url?: string;
   role?: string;
+  last_bonus_claim?: string;
+  login_streak?: number;
 }
 
 interface AuthContextType {

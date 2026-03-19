@@ -309,6 +309,53 @@ export default function Wallet() {
         </div>
       </section>
 
+      {/* Currency Guide Section */}
+      <section className="grid grid-cols-1 md:grid-cols-2 gap-8 py-8 border-t border-white/5">
+        <div className="space-y-4">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 rounded-lg bg-yellow-500/10 flex items-center justify-center">
+              <Coins className="w-4 h-4 text-yellow-500" />
+            </div>
+            <h3 className="text-lg font-black text-white uppercase italic tracking-tighter">About Gold Coins</h3>
+          </div>
+          <p className="text-sm text-slate-500 leading-relaxed">
+            Gold Coins (GC) are our social currency. They are designed for fun and social interaction. 
+            GC have no real-world value and cannot be redeemed for prizes. You can earn GC for free through 
+            daily bonuses, level ups, and social tasks.
+          </p>
+          <ul className="space-y-2">
+            {['Social play only', 'No redemption value', 'Earned for free'].map((item, i) => (
+              <li key={i} className="flex items-center gap-2 text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                <CheckCircle2 className="w-3 h-3 text-yellow-500" />
+                {item}
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        <div className="space-y-4">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 rounded-lg bg-emerald-500/10 flex items-center justify-center">
+              <Zap className="w-4 h-4 text-emerald-500" />
+            </div>
+            <h3 className="text-lg font-black text-white uppercase italic tracking-tighter">About Sweeps Coins</h3>
+          </div>
+          <p className="text-sm text-slate-500 leading-relaxed">
+            Sweeps Coins (SC) are used to enter our promotional sweepstakes. Winnings from games played with 
+            Sweeps Coins can be redeemed for real prizes! SC can never be purchased; they are always provided 
+            as a free bonus with GC purchases or via other free entry methods.
+          </p>
+          <ul className="space-y-2">
+            {['Redeemable for prizes', 'Always given for free', 'Secure redemptions'].map((item, i) => (
+              <li key={i} className="flex items-center gap-2 text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                <CheckCircle2 className="w-3 h-3 text-emerald-500" />
+                {item}
+              </li>
+            ))}
+          </ul>
+        </div>
+      </section>
+
       {/* Transaction History */}
       <section className="space-y-6">
         <div className="flex items-center gap-3">
