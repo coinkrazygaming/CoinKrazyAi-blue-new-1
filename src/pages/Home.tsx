@@ -24,9 +24,9 @@ export default function Home() {
   const { user } = useAuth();
   const featuredGames = [
     { id: 1, name: 'Krazy Slots', type: 'Slots', image: 'https://picsum.photos/seed/slots/800/600', slug: 'krazy-slots', players: '2.4k' },
-    { id: 2, name: 'Neon Dice', type: 'Dice', image: 'https://picsum.photos/seed/dice/800/600', slug: 'neon-dice', players: '1.1k' },
-    { id: 3, name: 'Scratch Tickets', type: 'Instant', image: 'https://picsum.photos/seed/scratch/800/600', slug: 'scratch-tickets', players: '850' },
-    { id: 4, name: 'Pull Tabs', type: 'Instant', image: 'https://picsum.photos/seed/pull/800/600', slug: 'pull-tabs', players: '420' },
+    { id: 2, name: 'Krazy Sweets', type: 'Slots', image: 'https://picsum.photos/seed/sweets/800/600', slug: 'krazy-sweets', players: '1.8k' },
+    { id: 3, name: 'Dog House Krazy', type: 'Slots', image: 'https://picsum.photos/seed/dog/800/600', slug: 'dog-house-krazy', players: '1.5k' },
+    { id: 4, name: 'Gates of Krazy', type: 'Slots', image: 'https://picsum.photos/seed/gates/800/600', slug: 'gates-of-krazy', players: '3.1k' },
   ];
 
   const liveWinners = [

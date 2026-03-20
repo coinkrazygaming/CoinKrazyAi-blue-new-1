@@ -9,14 +9,43 @@ import {
   Trophy, 
   Info,
   Loader2,
-  ChevronLeft
+  ChevronLeft,
+  Share2
 } from 'lucide-react';
 import { Button } from '../../components/ui/Button';
 import { Card, CardContent } from '../../components/ui/Card';
 import { useAuth } from '../../contexts/AuthContext';
 import { cn } from '../../lib/utils';
+import { toast } from 'sonner';
 
-const SYMBOLS = ['🍒', '🍋', '🍊', '🍇', '🔔', '💎', '7️⃣'];
+const THEME_SYMBOLS: Record<string, string[]> = {
+  classic: ['🍒', '🍋', '🍊', '🍇', '🔔', '💎', '7️⃣'],
+  sweets: ['🍭', '🍬', '🍩', '🧁', '🍦', '🍫', '🍪'],
+  dog: ['🐶', '🦴', '🏠', '🎾', '🐾', '🐕', '🐩'],
+  gates: ['⚡', '👑', '🏺', '💍', '💎', '🔱', '🏛️'],
+  rush: ['🐻', '🍬', '🍭', '🍓', '🍊', '🍇', '🍍'],
+  bass: ['🐟', '🎣', '🚤', '🪝', '🌊', '🐡', '🦈'],
+  wolf: ['🐺', '🌕', '🌵', '🦅', '🐃', '🐎', '🐾'],
+  buffalo: ['🦬', '🏜️', '🦅', '🐺', '🦌', '🌵', '🌅'],
+  rhino: ['🦏', '🌳', '🐆', '🦓', '🐘', '🦒', '🌍'],
+  gems: ['💎', '💍', '🏺', '🗿', '🎭', '👑', '🏯'],
+  joker: ['🃏', '🎭', '🔔', '7️⃣', '🍒', '🍋', '💎'],
+  fruits: ['🍎', '🍐', '🍊', '🍋', '🍌', '🍉', '🍇'],
+  gold: ['💰', '🪙', '💎', '⛏️', '🚂', '🧨', '🤠'],
+  knights: ['⚔️', '🛡️', '🏰', '🐎', '👑', '🐉', '🧙'],
+  leprechaun: ['🍀', '🌈', '🎩', '🍺', '🎻', '💰', '🧚'],
+  madame: ['🔮', '🕯️', '🃏', '🦉', '🌙', '⭐', '✨'],
+  mustang: ['🐎', '🌵', '🤠', '👢', '🏜️', '🦅', '🌅'],
+  panda: ['🐼', '🎋', '🏮', '🏯', '🌸', '🐉', '🧧'],
+  princess: ['👸', '🏰', '🦄', '👑', '💎', '✨', '💖'],
+  safari: ['🦁', '🐘', '🦒', '🦓', '🌳', '🌍', '📷'],
+  shark: ['🦈', '🌊', '⚓', '🚢', '🐠', '🐙', '🐚'],
+  spartan: ['🛡️', '⚔️', '🏛️', '🏺', '🐎', '👑', '🔥'],
+  tiki: ['🗿', '🍍', '🥥', '🌺', '🌊', '🏄', '🌋'],
+  vampire: ['🧛', '🦇', '⚰️', '🌙', '🏰', '🩸', '🕯️'],
+  viking: ['🪓', '🛡️', '⛵', '🍺', '🐺', '⚡', '🏔️'],
+  zeus: ['⚡', '🏛️', '🏺', '🕊️', '👑', '🔱', '☁️'],
+};
 
 import GameChat from '../../components/GameChat';
 
@@ -29,6 +58,7 @@ export default function Slots() {
   const [reels, setReels] = React.useState([0, 0, 0]);
   const [isSpinning, setIsSpinning] = React.useState(false);
   const [lastResult, setLastResult] = React.useState<any>(null);
+  const [isSharing, setIsSharing] = React.useState(false);
 
   const { data: gamesData } = useQuery({
     queryKey: ['games'],
@@ -39,6 +69,7 @@ export default function Slots() {
   });
 
   const game = gamesData?.games?.find((g: any) => g.slug === slug);
+  const symbols = THEME_SYMBOLS[game?.theme || 'classic'] || THEME_SYMBOLS.classic;
 
   const spinMutation = useMutation({
     mutationFn: async () => {
@@ -64,11 +95,43 @@ export default function Slots() {
     }
   });
 
+  const shareMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch('/api/social/posts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: `Just won ${lastResult.winAmount} ${currency.toUpperCase()} on ${game.name}! 🎰🔥`,
+          type: 'win_share',
+          game_id: game.id,
+          win_amount: lastResult.winAmount,
+          currency: currency
+        })
+      });
+      return res.json();
+    },
+    onSuccess: () => {
+      toast.success('Win shared to social feed!');
+      setIsSharing(false);
+    },
+    onError: () => {
+      toast.error('Failed to share win');
+      setIsSharing(false);
+    }
+  });
+
   const handleSpin = () => {
     if (isSpinning || !game) return;
     setIsSpinning(true);
     setLastResult(null);
     spinMutation.mutate();
+  };
+
+  const handleShareWin = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (isSharing || !lastResult?.isWin) return;
+    setIsSharing(true);
+    shareMutation.mutate();
   };
 
   if (!game) return <div className="text-center py-20"><Loader2 className="w-8 h-8 animate-spin mx-auto" /></div>;
@@ -127,7 +190,7 @@ export default function Slots() {
                       delay: isSpinning ? 0 : i * 0.1
                     }}
                   >
-                    {SYMBOLS[symbolIdx]}
+                    {symbols[symbolIdx]}
                   </motion.span>
                 </AnimatePresence>
               </motion.div>
@@ -216,9 +279,21 @@ export default function Slots() {
               exit={{ opacity: 0, scale: 0.5 }}
               className="absolute inset-0 flex items-center justify-center z-20 pointer-events-none"
             >
-              <div className="bg-blue-600 text-white px-8 py-4 rounded-full shadow-2xl shadow-blue-600/50 border-4 border-white/20 animate-bounce">
-                <h2 className="text-4xl font-black italic tracking-tighter">BIG WIN!</h2>
-                <p className="text-center font-bold">+{lastResult.winAmount} {currency.toUpperCase()}</p>
+              <div className="bg-blue-600 text-white px-8 py-4 rounded-3xl shadow-2xl shadow-blue-600/50 border-4 border-white/20 animate-bounce flex flex-col items-center gap-3 pointer-events-auto">
+                <div className="text-center">
+                  <h2 className="text-4xl font-black italic tracking-tighter">BIG WIN!</h2>
+                  <p className="text-center font-bold">+{lastResult.winAmount} {currency.toUpperCase()}</p>
+                </div>
+                <Button 
+                  size="sm" 
+                  variant="secondary" 
+                  className="gap-2 bg-white text-blue-600 hover:bg-white/90 font-bold"
+                  onClick={handleShareWin}
+                  disabled={isSharing}
+                >
+                  {isSharing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Share2 className="w-4 h-4" />}
+                  Share Win
+                </Button>
               </div>
             </motion.div>
           )}

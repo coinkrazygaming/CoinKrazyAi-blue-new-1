@@ -5,7 +5,7 @@ import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
-import Database from 'better-sqlite3';
+import { Pool } from 'pg';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { GoogleGenAI } from "@google/genai";
@@ -36,433 +36,504 @@ const JWT_SECRET = process.env.JWT_SECRET || 'coinkrazy-secret-key-123';
 const PORT = 3000;
 
 // Database Setup
-const db = new Database('coinkrazy.db');
-db.pragma('journal_mode = WAL');
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || 'postgresql://neondb_owner:npg_QiSKHaT5GIR9@ep-summer-feather-amuu2q6b-pooler.c-5.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require',
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+
+// Helper to mimic better-sqlite3's interface for simpler migration
+const db = {
+  prepare: (sql: string) => {
+    // Replace ? with $1, $2, etc.
+    let index = 1;
+    const pgSql = sql.replace(/\?/g, () => `$${index++}`);
+    return {
+      get: async (...params: any[]) => {
+        const result = await pool.query(pgSql, params);
+        return result.rows[0];
+      },
+      all: async (...params: any[]) => {
+        const result = await pool.query(pgSql, params);
+        return result.rows;
+      },
+      run: async (...params: any[]) => {
+        const result = await pool.query(pgSql, params);
+        return { lastInsertRowid: result.rows[0]?.id || null, changes: result.rowCount };
+      }
+    };
+  },
+  exec: async (sql: string) => {
+    await pool.query(sql);
+  },
+  transaction: (fn: Function) => {
+    return async (...args: any[]) => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const result = await fn(client, ...args);
+        await client.query('COMMIT');
+        return result;
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
+    };
+  }
+};
 
 // Initialize Schema
-db.exec(`
-  CREATE TABLE IF NOT EXISTS players (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT UNIQUE NOT NULL,
-    username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    avatar_url TEXT,
-    gc_balance REAL DEFAULT 1000,
-    sc_balance REAL DEFAULT 0,
-    total_wagered REAL DEFAULT 0,
-    vip_status TEXT DEFAULT 'Bronze',
-    kyc_verified INTEGER DEFAULT 0,
-    status TEXT DEFAULT 'Active',
-    role TEXT DEFAULT 'player',
-    referred_by INTEGER,
-    last_login DATETIME DEFAULT CURRENT_TIMESTAMP,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    kyc_status TEXT DEFAULT 'unverified',
-    last_bonus_claim DATETIME,
-    login_streak INTEGER DEFAULT 0
-  );
+async function initSchema() {
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS players (
+      id SERIAL PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      avatar_url TEXT,
+      gc_balance REAL DEFAULT 1000,
+      sc_balance REAL DEFAULT 0,
+      total_wagered REAL DEFAULT 0,
+      vip_status TEXT DEFAULT 'Bronze',
+      kyc_verified INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'Active',
+      role TEXT DEFAULT 'player',
+      referred_by INTEGER,
+      referral_code TEXT UNIQUE,
+      last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      kyc_status TEXT DEFAULT 'unverified',
+      last_bonus_claim TIMESTAMP,
+      login_streak INTEGER DEFAULT 0
+    );
 
-  -- Ensure columns exist for existing databases
-  ALTER TABLE players ADD COLUMN last_bonus_claim DATETIME;
-  ALTER TABLE players ADD COLUMN login_streak INTEGER DEFAULT 0;
+    CREATE TABLE IF NOT EXISTS game_results (
+      id SERIAL PRIMARY KEY,
+      player_id INTEGER NOT NULL REFERENCES players(id),
+      game_id INTEGER,
+      bet_amount REAL NOT NULL,
+      win_amount REAL NOT NULL,
+      currency TEXT NOT NULL,
+      multiplier REAL,
+      details TEXT,
+      result_data TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS games (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    slug TEXT UNIQUE NOT NULL,
-    name TEXT NOT NULL,
-    type TEXT NOT NULL, -- slots, crash, scratch, pulltab
-    description TEXT,
-    thumbnail_url TEXT,
-    enabled INTEGER DEFAULT 1,
-    rtp REAL DEFAULT 95.0,
-    min_bet REAL DEFAULT 0.1,
-    max_bet REAL DEFAULT 100.0,
-    is_featured INTEGER DEFAULT 0
-  );
+    CREATE TABLE IF NOT EXISTS posts (
+      id SERIAL PRIMARY KEY,
+      player_id INTEGER NOT NULL REFERENCES players(id),
+      content TEXT NOT NULL,
+      type TEXT DEFAULT 'update',
+      game_result_id INTEGER REFERENCES game_results(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS admin_notifications (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT NOT NULL, -- 'ai_task', 'kyc_submission', 'redemption_request', 'game_ready', 'social_campaign'
-    source_id INTEGER, -- ID of the related record
-    title TEXT NOT NULL,
-    content TEXT NOT NULL,
-    status TEXT DEFAULT 'pending', -- pending, approved, denied, actioned
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+    CREATE TABLE IF NOT EXISTS post_likes (
+      id SERIAL PRIMARY KEY,
+      post_id INTEGER NOT NULL REFERENCES posts(id),
+      player_id INTEGER NOT NULL REFERENCES players(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(post_id, player_id)
+    );
 
-  CREATE TABLE IF NOT EXISTS kyc_documents (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    document_type TEXT NOT NULL,
-    document_url TEXT NOT NULL,
-    status TEXT DEFAULT 'pending',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(player_id) REFERENCES players(id)
-  );
+    CREATE TABLE IF NOT EXISTS post_comments (
+      id SERIAL PRIMARY KEY,
+      post_id INTEGER NOT NULL REFERENCES posts(id),
+      player_id INTEGER NOT NULL REFERENCES players(id),
+      content TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS game_builder_sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    admin_id INTEGER NOT NULL,
-    game_id INTEGER,
-    name TEXT,
-    config TEXT,
-    history TEXT,
-    status TEXT DEFAULT 'active',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(admin_id) REFERENCES players(id)
-  );
+    CREATE TABLE IF NOT EXISTS referral_milestones (
+      id SERIAL PRIMARY KEY,
+      referral_id INTEGER NOT NULL,
+      milestone TEXT NOT NULL,
+      reward_gc REAL DEFAULT 0,
+      reward_sc REAL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(referral_id, milestone)
+    );
 
-  CREATE TABLE IF NOT EXISTS social_campaigns (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT NOT NULL, -- 'social_media', 'email', 'sms', 'retention'
-    platform TEXT,
-    title TEXT NOT NULL,
-    content TEXT NOT NULL,
-    status TEXT DEFAULT 'pending',
-    scheduled_at DATETIME,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+    CREATE TABLE IF NOT EXISTS games (
+      id SERIAL PRIMARY KEY,
+      slug TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      type TEXT NOT NULL,
+      description TEXT,
+      thumbnail_url TEXT,
+      theme TEXT DEFAULT 'classic',
+      enabled INTEGER DEFAULT 1,
+      rtp REAL DEFAULT 95.0,
+      min_bet REAL DEFAULT 0.1,
+      max_bet REAL DEFAULT 100.0,
+      is_featured INTEGER DEFAULT 0
+    );
 
-  CREATE TABLE IF NOT EXISTS ai_employees (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    role TEXT NOT NULL,
-    description TEXT,
-    avatar_url TEXT,
-    status TEXT DEFAULT 'online',
-    current_task TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+    CREATE TABLE IF NOT EXISTS admin_notifications (
+      id SERIAL PRIMARY KEY,
+      type TEXT NOT NULL,
+      source_id INTEGER,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS ai_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    employee_id INTEGER NOT NULL,
-    type TEXT NOT NULL, -- task, report, alert, review
-    content TEXT NOT NULL,
-    status TEXT DEFAULT 'pending', -- pending, approved, denied
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(employee_id) REFERENCES ai_employees(id)
-  );
+    CREATE TABLE IF NOT EXISTS kyc_documents (
+      id SERIAL PRIMARY KEY,
+      player_id INTEGER NOT NULL REFERENCES players(id),
+      document_type TEXT NOT NULL,
+      document_url TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS ai_chats (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    employee_id INTEGER NOT NULL,
-    sender TEXT NOT NULL, -- admin, ai
-    message TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(employee_id) REFERENCES ai_employees(id)
-  );
+    CREATE TABLE IF NOT EXISTS site_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS coin_packages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    gc_amount REAL NOT NULL,
-    sc_amount REAL NOT NULL,
-    price REAL NOT NULL,
-    image_url TEXT,
-    is_featured INTEGER DEFAULT 0
-  );
+    CREATE TABLE IF NOT EXISTS wallet_transactions (
+      id SERIAL PRIMARY KEY,
+      player_id INTEGER NOT NULL REFERENCES players(id),
+      type TEXT NOT NULL,
+      gc_amount REAL DEFAULT 0,
+      sc_amount REAL DEFAULT 0,
+      description TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS site_settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-  );
+    CREATE TABLE IF NOT EXISTS friendships (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES players(id),
+      friend_id INTEGER NOT NULL REFERENCES players(id),
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, friend_id)
+    );
 
-  CREATE TABLE IF NOT EXISTS wallet_transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    type TEXT NOT NULL, -- deposit, withdrawal, bet, win, bonus, admin_adjustment, ticket_purchase, ticket_win
-    gc_amount REAL DEFAULT 0,
-    sc_amount REAL DEFAULT 0,
-    description TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(player_id) REFERENCES players(id)
-  );
+    CREATE TABLE IF NOT EXISTS challenges (
+      id SERIAL PRIMARY KEY,
+      title TEXT UNIQUE NOT NULL,
+      description TEXT NOT NULL,
+      requirement_type TEXT NOT NULL,
+      requirement_value REAL NOT NULL,
+      reward_gc REAL DEFAULT 0,
+      reward_sc REAL DEFAULT 0,
+      difficulty INTEGER DEFAULT 1,
+      expires_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS game_results (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    game_id INTEGER NOT NULL,
-    bet_amount REAL NOT NULL,
-    win_amount REAL NOT NULL,
-    currency TEXT NOT NULL,
-    multiplier REAL,
-    details TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(player_id) REFERENCES players(id),
-    FOREIGN KEY(game_id) REFERENCES games(id)
-  );
+    CREATE TABLE IF NOT EXISTS player_challenges (
+      id SERIAL PRIMARY KEY,
+      player_id INTEGER NOT NULL REFERENCES players(id),
+      challenge_id INTEGER NOT NULL REFERENCES challenges(id),
+      progress REAL DEFAULT 0,
+      status TEXT DEFAULT 'active',
+      started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      completed_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(player_id, challenge_id)
+    );
 
-  CREATE TABLE IF NOT EXISTS ticket_types (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    type TEXT NOT NULL, -- scratch, pulltab
-    price_sc REAL NOT NULL,
-    top_prize_sc REAL NOT NULL,
-    total_tickets INTEGER NOT NULL,
-    remaining_tickets INTEGER NOT NULL,
-    odds_description TEXT,
-    theme_images TEXT, -- JSON array of image URLs
-    is_active INTEGER DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+    CREATE TABLE IF NOT EXISTS tournaments (
+      id SERIAL PRIMARY KEY,
+      name TEXT UNIQUE NOT NULL,
+      game_slug TEXT NOT NULL,
+      start_time TIMESTAMP NOT NULL,
+      end_time TIMESTAMP NOT NULL,
+      entry_fee REAL DEFAULT 0,
+      prize_pool REAL NOT NULL,
+      currency TEXT DEFAULT 'gc',
+      status TEXT DEFAULT 'active',
+      scoring_type TEXT DEFAULT 'highest_win_multiplier',
+      max_participants INTEGER DEFAULT 100,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS ticket_purchases (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    ticket_type_id INTEGER NOT NULL,
-    status TEXT DEFAULT 'purchased', -- purchased, revealed, claimed, saved
-    is_win INTEGER DEFAULT 0,
-    win_amount REAL DEFAULT 0,
-    reveal_data TEXT, -- JSON of what was revealed
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(player_id) REFERENCES players(id),
-    FOREIGN KEY(ticket_type_id) REFERENCES ticket_types(id)
-  );
+    CREATE TABLE IF NOT EXISTS tournament_participants (
+      tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+      player_id INTEGER NOT NULL REFERENCES players(id),
+      score REAL DEFAULT 0,
+      rank INTEGER,
+      joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(tournament_id, player_id)
+    );
 
-  CREATE TABLE IF NOT EXISTS user_saved_wins (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    purchase_id INTEGER NOT NULL,
-    ticket_name TEXT NOT NULL,
-    amount_won REAL NOT NULL,
-    image_url TEXT,
-    claimed INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(player_id) REFERENCES players(id),
-    FOREIGN KEY(purchase_id) REFERENCES ticket_purchases(id)
-  );
+    CREATE TABLE IF NOT EXISTS messages (
+      id SERIAL PRIMARY KEY,
+      sender_id INTEGER NOT NULL REFERENCES players(id),
+      receiver_id INTEGER NOT NULL REFERENCES players(id),
+      content TEXT NOT NULL,
+      is_read INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS friendships (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    friend_id INTEGER NOT NULL,
-    status TEXT DEFAULT 'pending', -- pending, accepted, blocked
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(user_id) REFERENCES players(id),
-    FOREIGN KEY(friend_id) REFERENCES players(id)
-  );
+    CREATE TABLE IF NOT EXISTS game_chat_messages (
+      id SERIAL PRIMARY KEY,
+      game_slug TEXT NOT NULL,
+      player_id INTEGER NOT NULL REFERENCES players(id),
+      content TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS social_links (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    platform TEXT NOT NULL,
-    platform_username TEXT,
-    access_token TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(player_id) REFERENCES players(id)
-  );
+    CREATE TABLE IF NOT EXISTS game_builder_sessions (
+      id SERIAL PRIMARY KEY,
+      admin_id INTEGER NOT NULL REFERENCES players(id),
+      game_id INTEGER REFERENCES games(id),
+      name TEXT,
+      config TEXT,
+      history TEXT,
+      status TEXT DEFAULT 'active',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS activity_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    action TEXT NOT NULL,
-    details TEXT,
-    ip_address TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(user_id) REFERENCES players(id)
-  );
+    CREATE TABLE IF NOT EXISTS social_campaigns (
+      id SERIAL PRIMARY KEY,
+      type TEXT NOT NULL,
+      platform TEXT,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      scheduled_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS tournaments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    game_slug TEXT NOT NULL,
-    start_time DATETIME NOT NULL,
-    end_time DATETIME NOT NULL,
-    entry_fee REAL DEFAULT 0,
-    prize_pool REAL NOT NULL,
-    currency TEXT NOT NULL DEFAULT 'gc',
-    status TEXT DEFAULT 'upcoming', -- upcoming, active, completed
-    scoring_type TEXT DEFAULT 'highest_win_multiplier', -- highest_win_multiplier, total_wagered, total_wins
-    max_participants INTEGER DEFAULT 100,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+    CREATE TABLE IF NOT EXISTS ai_employees (
+      id SERIAL PRIMARY KEY,
+      name TEXT UNIQUE NOT NULL,
+      role TEXT NOT NULL,
+      description TEXT,
+      avatar_url TEXT,
+      status TEXT DEFAULT 'online',
+      current_task TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS tournament_participants (
-    tournament_id INTEGER NOT NULL,
-    player_id INTEGER NOT NULL,
-    score REAL DEFAULT 0,
-    rank INTEGER,
-    joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY(tournament_id, player_id),
-    FOREIGN KEY(tournament_id) REFERENCES tournaments(id),
-    FOREIGN KEY(player_id) REFERENCES players(id)
-  );
+    CREATE TABLE IF NOT EXISTS ai_logs (
+      id SERIAL PRIMARY KEY,
+      employee_id INTEGER NOT NULL REFERENCES ai_employees(id),
+      type TEXT NOT NULL,
+      content TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS redemptions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    amount_sc REAL NOT NULL,
-    method TEXT NOT NULL,
-    details TEXT,
-    status TEXT DEFAULT 'pending', -- pending, approved, rejected, paid
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    processed_at DATETIME,
-    FOREIGN KEY(player_id) REFERENCES players(id)
-  );
+    CREATE TABLE IF NOT EXISTS ai_chats (
+      id SERIAL PRIMARY KEY,
+      employee_id INTEGER NOT NULL REFERENCES ai_employees(id),
+      sender TEXT NOT NULL,
+      message TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS chat_messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    game_slug TEXT NOT NULL,
-    user_id INTEGER NOT NULL,
-    message TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(user_id) REFERENCES players(id)
-  );
+    CREATE TABLE IF NOT EXISTS coin_packages (
+      id SERIAL PRIMARY KEY,
+      name TEXT UNIQUE NOT NULL,
+      gc_amount REAL NOT NULL,
+      sc_amount REAL NOT NULL,
+      price REAL NOT NULL,
+      image_url TEXT,
+      is_featured INTEGER DEFAULT 0
+    );
 
-  CREATE TABLE IF NOT EXISTS achievements (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    description TEXT NOT NULL,
-    icon TEXT,
-    requirement_type TEXT NOT NULL,
-    requirement_value REAL NOT NULL,
-    reward_gc REAL DEFAULT 0,
-    reward_sc REAL DEFAULT 0
-  );
+    CREATE TABLE IF NOT EXISTS ticket_types (
+      id SERIAL PRIMARY KEY,
+      name TEXT UNIQUE NOT NULL,
+      type TEXT NOT NULL,
+      price_sc REAL NOT NULL,
+      top_prize_sc REAL NOT NULL,
+      total_tickets INTEGER NOT NULL,
+      remaining_tickets INTEGER NOT NULL,
+      odds_description TEXT,
+      theme_images TEXT,
+      is_active INTEGER DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS player_achievements (
-    player_id INTEGER NOT NULL,
-    achievement_id INTEGER NOT NULL,
-    unlocked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY(player_id, achievement_id),
-    FOREIGN KEY(player_id) REFERENCES players(id),
-    FOREIGN KEY(achievement_id) REFERENCES achievements(id)
-  );
+    CREATE TABLE IF NOT EXISTS ticket_purchases (
+      id SERIAL PRIMARY KEY,
+      player_id INTEGER NOT NULL REFERENCES players(id),
+      ticket_type_id INTEGER NOT NULL REFERENCES ticket_types(id),
+      status TEXT DEFAULT 'purchased',
+      is_win INTEGER DEFAULT 0,
+      win_amount REAL DEFAULT 0,
+      reveal_data TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS challenges (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL,
-    requirement_type TEXT NOT NULL, -- 'win_streak', 'total_wager', 'specific_game_win', 'multiplier'
-    requirement_value REAL NOT NULL,
-    reward_gc REAL DEFAULT 0,
-    reward_sc REAL DEFAULT 0,
-    difficulty INTEGER DEFAULT 1, -- 1 to 5
-    expires_at DATETIME,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+    CREATE TABLE IF NOT EXISTS user_saved_wins (
+      id SERIAL PRIMARY KEY,
+      player_id INTEGER NOT NULL REFERENCES players(id),
+      purchase_id INTEGER NOT NULL REFERENCES ticket_purchases(id),
+      ticket_name TEXT NOT NULL,
+      amount_won REAL NOT NULL,
+      image_url TEXT,
+      claimed INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS player_challenges (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    challenge_id INTEGER NOT NULL,
-    progress REAL DEFAULT 0,
-    status TEXT DEFAULT 'active', -- active, completed, failed
-    started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    completed_at DATETIME,
-    FOREIGN KEY(player_id) REFERENCES players(id),
-    FOREIGN KEY(challenge_id) REFERENCES challenges(id)
-  );
+    CREATE TABLE IF NOT EXISTS social_links (
+      id SERIAL PRIMARY KEY,
+      player_id INTEGER NOT NULL REFERENCES players(id),
+      platform TEXT NOT NULL,
+      platform_username TEXT,
+      access_token TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(player_id, platform)
+    );
 
-  CREATE TABLE IF NOT EXISTS bonuses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    type TEXT NOT NULL, -- 'deposit_match', 'free_spins', 'cashback', 'loyalty'
-    description TEXT,
-    code TEXT UNIQUE,
-    reward_gc REAL DEFAULT 0,
-    reward_sc REAL DEFAULT 0,
-    min_deposit REAL DEFAULT 0,
-    wagering_requirement REAL DEFAULT 0, -- multiplier of bonus amount
-    game_eligibility TEXT, -- JSON array of game slugs or 'all'
-    max_win REAL,
-    expiration_days INTEGER,
-    status TEXT DEFAULT 'active', -- active, paused, deleted
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+    CREATE TABLE IF NOT EXISTS activity_logs (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES players(id),
+      action TEXT NOT NULL,
+      details TEXT,
+      ip_address TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS player_bonuses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id INTEGER NOT NULL,
-    bonus_id INTEGER NOT NULL,
-    status TEXT DEFAULT 'active', -- active, completed, expired, cancelled
-    wagering_progress REAL DEFAULT 0,
-    wagering_target REAL NOT NULL,
-    expires_at DATETIME,
-    claimed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    completed_at DATETIME,
-    FOREIGN KEY(player_id) REFERENCES players(id),
-    FOREIGN KEY(bonus_id) REFERENCES bonuses(id)
-  );
+    CREATE TABLE IF NOT EXISTS redemptions (
+      id SERIAL PRIMARY KEY,
+      player_id INTEGER NOT NULL REFERENCES players(id),
+      amount_sc REAL NOT NULL,
+      method TEXT NOT NULL,
+      details TEXT,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      processed_at TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS forum_boards (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    description TEXT,
-    slug TEXT UNIQUE NOT NULL,
-    display_order INTEGER DEFAULT 0
-  );
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id SERIAL PRIMARY KEY,
+      game_slug TEXT NOT NULL,
+      user_id INTEGER NOT NULL REFERENCES players(id),
+      message TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS forum_topics (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    board_id INTEGER NOT NULL,
-    author_id INTEGER NOT NULL,
-    title TEXT NOT NULL,
-    content TEXT NOT NULL,
-    is_pinned INTEGER DEFAULT 0,
-    is_locked INTEGER DEFAULT 0,
-    views INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(board_id) REFERENCES forum_boards(id),
-    FOREIGN KEY(author_id) REFERENCES players(id)
-  );
+    CREATE TABLE IF NOT EXISTS achievements (
+      id SERIAL PRIMARY KEY,
+      name TEXT UNIQUE NOT NULL,
+      description TEXT NOT NULL,
+      icon TEXT,
+      requirement_type TEXT NOT NULL,
+      requirement_value REAL NOT NULL,
+      reward_gc REAL DEFAULT 0,
+      reward_sc REAL DEFAULT 0
+    );
 
-  CREATE TABLE IF NOT EXISTS forum_posts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    topic_id INTEGER NOT NULL,
-    author_id INTEGER NOT NULL,
-    content TEXT NOT NULL,
-    parent_id INTEGER, -- For threaded replies
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(topic_id) REFERENCES forum_topics(id),
-    FOREIGN KEY(author_id) REFERENCES players(id),
-    FOREIGN KEY(parent_id) REFERENCES forum_posts(id)
-  );
+    CREATE TABLE IF NOT EXISTS player_achievements (
+      player_id INTEGER NOT NULL REFERENCES players(id),
+      achievement_id INTEGER NOT NULL REFERENCES achievements(id),
+      unlocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(player_id, achievement_id)
+    );
 
-  CREATE TABLE IF NOT EXISTS forum_likes (
-    post_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY(post_id, user_id),
-    FOREIGN KEY(post_id) REFERENCES forum_posts(id),
-    FOREIGN KEY(user_id) REFERENCES players(id)
-  );
+    CREATE TABLE IF NOT EXISTS bonuses (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      type TEXT NOT NULL,
+      description TEXT,
+      code TEXT UNIQUE,
+      reward_gc REAL DEFAULT 0,
+      reward_sc REAL DEFAULT 0,
+      min_deposit REAL DEFAULT 0,
+      wagering_requirement REAL DEFAULT 0,
+      game_eligibility TEXT,
+      max_win REAL,
+      expiration_days INTEGER,
+      status TEXT DEFAULT 'active',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS global_chat_messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    message TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(user_id) REFERENCES players(id)
-  );
+    CREATE TABLE IF NOT EXISTS player_bonuses (
+      id SERIAL PRIMARY KEY,
+      player_id INTEGER NOT NULL REFERENCES players(id),
+      bonus_id INTEGER NOT NULL REFERENCES bonuses(id),
+      status TEXT DEFAULT 'active',
+      wagering_progress REAL DEFAULT 0,
+      wagering_target REAL NOT NULL,
+      expires_at TIMESTAMP,
+      claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      completed_at TIMESTAMP
+    );
 
-  CREATE TABLE IF NOT EXISTS community_moderation_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    action TEXT NOT NULL, -- 'warning', 'mute', 'kick', 'ban'
-    reason TEXT,
-    duration_minutes INTEGER,
-    moderator_id TEXT DEFAULT 'SecurityAi',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(user_id) REFERENCES players(id)
-  );
+    CREATE TABLE IF NOT EXISTS forum_boards (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      slug TEXT UNIQUE NOT NULL,
+      display_order INTEGER DEFAULT 0
+    );
 
-  CREATE TABLE IF NOT EXISTS player_community_status (
-    player_id INTEGER PRIMARY KEY,
-    offense_count INTEGER DEFAULT 0,
-    mute_until DATETIME,
-    is_banned INTEGER DEFAULT 0,
-    FOREIGN KEY(player_id) REFERENCES players(id)
-  );
+    CREATE TABLE IF NOT EXISTS forum_topics (
+      id SERIAL PRIMARY KEY,
+      board_id INTEGER NOT NULL REFERENCES forum_boards(id),
+      author_id INTEGER NOT NULL REFERENCES players(id),
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      is_pinned INTEGER DEFAULT 0,
+      is_locked INTEGER DEFAULT 0,
+      views INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS forum_posts (
+      id SERIAL PRIMARY KEY,
+      topic_id INTEGER NOT NULL REFERENCES forum_topics(id),
+      author_id INTEGER NOT NULL REFERENCES players(id),
+      content TEXT NOT NULL,
+      parent_id INTEGER REFERENCES forum_posts(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS forum_likes (
+      post_id INTEGER NOT NULL REFERENCES forum_posts(id),
+      user_id INTEGER NOT NULL REFERENCES players(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(post_id, user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS global_chat_messages (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES players(id),
+      message TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS community_moderation_logs (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES players(id),
+      action TEXT NOT NULL,
+      reason TEXT,
+      duration_minutes INTEGER,
+      moderator_id TEXT DEFAULT 'SecurityAi',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS player_community_status (
+      player_id INTEGER PRIMARY KEY REFERENCES players(id),
+      offense_count INTEGER DEFAULT 0,
+      mute_until TIMESTAMP,
+      is_banned INTEGER DEFAULT 0
+    );
+  `);
+}
+
 `);
 
 // Initialize Settings
-const initSettings = () => {
+const initSettings = async () => {
   const defaultSettings = {
     'site_name': 'CoinKrazy AI',
     'maintenance_mode': 'false',
@@ -481,24 +552,28 @@ const initSettings = () => {
     'enable_social_tiktok': 'true',
   };
   
-  const insert = db.prepare('INSERT OR IGNORE INTO site_settings (key, value) VALUES (?, ?)');
-  Object.entries(defaultSettings).forEach(([k, v]) => insert.run(k, v));
+  const insert = db.prepare('INSERT INTO site_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING');
+  for (const [k, v] of Object.entries(defaultSettings)) {
+    await insert.run(k, v);
+  }
 };
 
 // Seed Coin Packages
-const seedPackages = () => {
+const seedPackages = async () => {
   const packages = [
     { name: 'Starter Pack', gc_amount: 10000, sc_amount: 5, price: 4.99, image_url: 'https://picsum.photos/seed/starter/200/200', is_featured: 0 },
     { name: 'Pro Pack', gc_amount: 50000, sc_amount: 25, price: 19.99, image_url: 'https://picsum.photos/seed/pro/200/200', is_featured: 1 },
     { name: 'Whale Pack', gc_amount: 250000, sc_amount: 125, price: 99.99, image_url: 'https://picsum.photos/seed/whale/200/200', is_featured: 0 },
   ];
   
-  const insert = db.prepare('INSERT OR IGNORE INTO coin_packages (name, gc_amount, sc_amount, price, image_url, is_featured) VALUES (?, ?, ?, ?, ?, ?)');
-  packages.forEach(p => insert.run(p.name, p.gc_amount, p.sc_amount, p.price, p.image_url, p.is_featured));
+  const insert = db.prepare('INSERT INTO coin_packages (name, gc_amount, sc_amount, price, image_url, is_featured) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING');
+  for (const p of packages) {
+    await insert.run(p.name, p.gc_amount, p.sc_amount, p.price, p.image_url, p.is_featured);
+  }
 };
 
 // Seed AI Employees
-const seedAiEmployees = () => {
+const seedAiEmployees = async () => {
   const employees = [
     { name: 'DevAi', role: 'Lead Game Developer', description: 'Master of game mechanics, rebranding, and automated game pipelines.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=DevAi' },
     { name: 'SocialAi', role: 'Social Media & Marketing Manager', description: 'Handles social media, email campaigns, SMS, and player retention.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=SocialAi' },
@@ -507,21 +582,17 @@ const seedAiEmployees = () => {
     { name: 'AdminAi', role: 'Admin Assistant', description: 'Suggests site updates, manages settings, and compiles reports.', avatar_url: 'https://api.dicebear.com/7.x/bottts/svg?seed=AdminAi' },
   ];
 
-  const insert = db.prepare('INSERT OR IGNORE INTO ai_employees (name, role, description, avatar_url) VALUES (?, ?, ?, ?)');
+  const insert = db.prepare('INSERT INTO ai_employees (name, role, description, avatar_url) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING');
   const check = db.prepare('SELECT id FROM ai_employees WHERE name = ?');
   
-  employees.forEach(e => {
-    if (!check.get(e.name)) {
-      insert.run(e.name, e.role, e.description, e.avatar_url);
+  for (const e of employees) {
+    if (!(await check.get(e.name))) {
+      await insert.run(e.name, e.role, e.description, e.avatar_url);
     }
-  });
+  }
 };
 
-initSettings();
-seedPackages();
-seedAiEmployees();
-
-const seedForumBoards = () => {
+const seedForumBoards = async () => {
   const boards = [
     { name: 'General Discussion', description: 'Talk about anything platform related.', slug: 'general', display_order: 1 },
     { name: 'Game Discussions', description: 'Strategies, tips, and talk about your favorite games.', slug: 'games', display_order: 2 },
@@ -530,13 +601,27 @@ const seedForumBoards = () => {
     { name: 'Off-Topic', description: 'Anything else on your mind.', slug: 'off-topic', display_order: 5 },
   ];
 
-  const insert = db.prepare('INSERT OR IGNORE INTO forum_boards (name, description, slug, display_order) VALUES (?, ?, ?, ?)');
-  boards.forEach(b => insert.run(b.name, b.description, b.slug, b.display_order));
+  const insert = db.prepare('INSERT INTO forum_boards (name, description, slug, display_order) VALUES (?, ?, ?, ?) ON CONFLICT (slug) DO NOTHING');
+  for (const b of boards) {
+    await insert.run(b.name, b.description, b.slug, b.display_order);
+  }
 };
 
-seedForumBoards();
+const startServer = async () => {
+  await initSchema();
+  await initSettings();
+  await seedPackages();
+  await seedAiEmployees();
+  await seedForumBoards();
+  await seedGames();
+  await seedAchievements();
+  await seedAdmin();
+  await seedTournaments();
+  await seedTicketTypes();
+  await seedChallenges();
+};
 
-// Middleware to verify JWT
+startServer();
 const authenticate = (req: any, res: any, next: any) => {
   const token = req.cookies.token;
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
@@ -557,15 +642,15 @@ const isAdmin = (req: any, res: any, next: any) => {
 };
 
 // Admin Endpoints
-app.get('/api/admin/stats', authenticate, isAdmin, (req: any, res) => {
+app.get('/api/admin/stats', authenticate, isAdmin, async (req: any, res) => {
   try {
-    const totalUsers = db.prepare('SELECT COUNT(*) as count FROM players').get() as any;
-    const totalWagered = db.prepare('SELECT SUM(total_wagered) as amount FROM players').get() as any;
-    const recentUsers = db.prepare('SELECT * FROM players ORDER BY created_at DESC LIMIT 5').all();
+    const totalUsers = await db.prepare('SELECT COUNT(*) as count FROM players').get() as any;
+    const totalWagered = await db.prepare('SELECT SUM(total_wagered) as amount FROM players').get() as any;
+    const recentUsers = await db.prepare('SELECT * FROM players ORDER BY created_at DESC LIMIT 5').all();
     
     res.json({
       totalUsers: totalUsers.count,
-      totalWagered: totalWagered.amount,
+      totalWagered: totalWagered.amount || 0,
       recentUsers
     });
   } catch (error: any) {
@@ -573,9 +658,9 @@ app.get('/api/admin/stats', authenticate, isAdmin, (req: any, res) => {
   }
 });
 
-app.get('/api/admin/settings', authenticate, isAdmin, (req: any, res) => {
+app.get('/api/admin/settings', authenticate, isAdmin, async (req: any, res) => {
   try {
-    const settings = db.prepare('SELECT * FROM site_settings').all();
+    const settings = await db.prepare('SELECT * FROM site_settings').all();
     const settingsMap: any = {};
     settings.forEach((s: any) => settingsMap[s.key] = s.value);
     res.json(settingsMap);
@@ -584,15 +669,24 @@ app.get('/api/admin/settings', authenticate, isAdmin, (req: any, res) => {
   }
 });
 
-app.post('/api/admin/settings', authenticate, isAdmin, (req: any, res) => {
+app.post('/api/admin/settings', authenticate, isAdmin, async (req: any, res) => {
   const settings = req.body;
   try {
-    const insert = db.prepare('INSERT OR REPLACE INTO site_settings (key, value) VALUES (?, ?)');
-    const transaction = db.transaction(() => {
-      Object.entries(settings).forEach(([k, v]) => insert.run(k, String(v)));
-    });
-    transaction();
-    res.json({ success: true });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const insert = db.prepare('INSERT INTO site_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value');
+      for (const [k, v] of Object.entries(settings)) {
+        await insert.run(k, String(v));
+      }
+      await client.query('COMMIT');
+      res.json({ success: true });
+    } catch (error: any) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -915,12 +1009,13 @@ const moderateContent = async (userId: number, content: string, type: 'chat' | '
 // Update Challenge Progress
 const updateChallengeProgress = (userId: number, gameId: number, betAmount: number, winAmount: number, currency: string, multiplier: number) => {
   try {
+    const today = new Date().toISOString().split('T')[0];
     const activeChallenges = db.prepare(`
       SELECT pc.id as player_challenge_id, c.*, pc.progress 
       FROM player_challenges pc
       JOIN challenges c ON pc.challenge_id = c.id
-      WHERE pc.player_id = ? AND pc.status = 'active'
-    `).all(userId) as any[];
+      WHERE pc.player_id = ? AND pc.status = 'active' AND date(pc.started_at) = date(?)
+    `).all(userId, today) as any[];
 
     for (const challenge of activeChallenges) {
       let newProgress = challenge.progress;
@@ -932,25 +1027,30 @@ const updateChallengeProgress = (userId: number, gameId: number, betAmount: numb
       } else if (challenge.requirement_type === 'specific_game_win' && winAmount > 0) {
         newProgress += 1;
         if (newProgress >= challenge.requirement_value) completed = true;
+      } else if (challenge.requirement_type === 'play_count') {
+        newProgress += 1;
+        if (newProgress >= challenge.requirement_value) completed = true;
       } else if (challenge.requirement_type === 'multiplier' && multiplier >= challenge.requirement_value) {
         completed = true;
       }
 
       if (completed) {
-        db.transaction(() => {
-          db.prepare('UPDATE player_challenges SET progress = ?, status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?')
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await db.prepare('UPDATE player_challenges SET progress = ?, status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?')
             .run(challenge.requirement_value, 'completed', challenge.player_challenge_id);
           
           // Award rewards
           if (challenge.reward_gc > 0 || challenge.reward_sc > 0) {
-            db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
+            await db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
               .run(challenge.reward_gc, challenge.reward_sc, userId);
             
-            db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+            await db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
               .run(userId, 'bonus', challenge.reward_gc, challenge.reward_sc, `Challenge Completed: ${challenge.title}`);
             
             // Notify via socket
-            const user = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(userId) as any;
+            const user = await db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(userId) as any;
             io.to(`user-${userId}`).emit('balance-update', {
               gc_balance: user.gc_balance,
               sc_balance: user.sc_balance
@@ -961,7 +1061,13 @@ const updateChallengeProgress = (userId: number, gameId: number, betAmount: numb
               type: 'success'
             });
           }
-        })();
+          await client.query('COMMIT');
+        } catch (error) {
+          await client.query('ROLLBACK');
+          throw error;
+        } finally {
+          client.release();
+        }
       } else if (newProgress !== challenge.progress) {
         db.prepare('UPDATE player_challenges SET progress = ? WHERE id = ?').run(newProgress, challenge.player_challenge_id);
       }
@@ -971,7 +1077,78 @@ const updateChallengeProgress = (userId: number, gameId: number, betAmount: numb
   }
 };
 
+// Seed Challenges
+const seedChallenges = async () => {
+  const challenges = [
+    { title: 'Slot Enthusiast', description: 'Play 10 slot spins', requirement_type: 'play_count', requirement_value: 10, reward_gc: 500, reward_sc: 0, difficulty: 1 },
+    { title: 'High Roller', description: 'Wager 5000 GC in any game', requirement_type: 'total_wager', requirement_value: 5000, reward_gc: 2000, reward_sc: 0, difficulty: 2 },
+    { title: 'Lucky Strike', description: 'Win a game with at least a 5x multiplier', requirement_type: 'multiplier', requirement_value: 5, reward_gc: 0, reward_sc: 0.5, difficulty: 3 },
+    { title: 'Dice Master', description: 'Play 20 dice rolls', requirement_type: 'play_count', requirement_value: 20, reward_gc: 1000, reward_sc: 0, difficulty: 2 },
+    { title: 'Big Winner', description: 'Win 5 games with any multiplier', requirement_type: 'specific_game_win', requirement_value: 5, reward_gc: 0, reward_sc: 1, difficulty: 4 },
+  ];
+
+  const insert = db.prepare('INSERT INTO challenges (title, description, requirement_type, requirement_value, reward_gc, reward_sc, difficulty) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (title) DO NOTHING');
+  const check = db.prepare('SELECT id FROM challenges WHERE title = ?');
+  
+  for (const c of challenges) {
+    if (!(await check.get(c.title))) {
+      await insert.run(c.title, c.description, c.requirement_type, c.requirement_value, c.reward_gc, c.reward_sc, c.difficulty);
+    }
+  }
+};
+
+seedChallenges();
+
 // API Routes
+app.get('/api/challenges', authenticate, (req: any, res) => {
+  try {
+    const userId = req.user.id;
+    const today = new Date().toISOString().split('T')[0];
+
+    // Check if user has challenges for today
+    const userChallenges = db.prepare(`
+      SELECT pc.*, c.title, c.description, c.requirement_type, c.requirement_value, c.reward_gc, c.reward_sc, c.difficulty
+      FROM player_challenges pc
+      JOIN challenges c ON pc.challenge_id = c.id
+      WHERE pc.player_id = ? AND date(pc.started_at) = date(?)
+    `).all(userId, today) as any[];
+
+    if (userChallenges.length === 0) {
+      // Assign 3 random challenges for today
+      const allChallenges = db.prepare('SELECT id FROM challenges').all() as any[];
+      const randomChallenges = allChallenges.sort(() => 0.5 - Math.random()).slice(0, 3);
+      
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const insert = db.prepare('INSERT INTO player_challenges (player_id, challenge_id, status) VALUES (?, ?, ?)');
+        for (const c of randomChallenges) {
+          await insert.run(userId, c.id, 'active');
+        }
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+
+      // Fetch again
+      const newChallenges = db.prepare(`
+        SELECT pc.*, c.title, c.description, c.requirement_type, c.requirement_value, c.reward_gc, c.reward_sc, c.difficulty
+        FROM player_challenges pc
+        JOIN challenges c ON pc.challenge_id = c.id
+        WHERE pc.player_id = ? AND date(pc.started_at) = date(?)
+      `).all(userId, today);
+      
+      return res.json({ challenges: newChallenges });
+    }
+
+    res.json({ challenges: userChallenges });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -1002,43 +1179,53 @@ app.post('/api/auth/register', async (req, res) => {
 
     let newUserId: any;
 
-    const transaction = db.transaction(() => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
       // Create User
       const stmt = db.prepare('INSERT INTO players (email, username, password_hash, referral_code, referred_by, gc_balance, sc_balance) VALUES (?, ?, ?, ?, ?, ?, ?)');
-      const result = stmt.run(email, username, password_hash, newReferralCode, referrerId, signupBonusGC, signupBonusSC);
+      const result = await stmt.run(email, username, password_hash, newReferralCode, referrerId, signupBonusGC, signupBonusSC);
       newUserId = result.lastInsertRowid;
 
       // Handle Referral Logic
       if (referrerId) {
         // Bonus for Referrer
-        db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
+        await db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
           .run(referralBonusGC, referralBonusSC, referrerId);
         
         // Bonus for New User (on top of signup bonus)
-        db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
+        await db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
           .run(referralBonusGC, referralBonusSC, newUserId);
 
+        // Record Milestone
+        await db.prepare('INSERT INTO referral_milestones (referral_id, milestone, reward_gc, reward_sc) VALUES (?, ?, ?, ?)')
+          .run(newUserId, 'signup', referralBonusGC, referralBonusSC);
+
         // Create Friendship
-        db.prepare('INSERT INTO friendships (user_id, friend_id, status) VALUES (?, ?, ?)')
+        await db.prepare('INSERT INTO friendships (user_id, friend_id, status) VALUES (?, ?, ?)')
           .run(referrerId, newUserId, 'accepted');
 
         // Log Transactions
-        db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+        await db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
           .run(referrerId, 'Referral', referralBonusGC, referralBonusSC, `Referral bonus for inviting ${username}`);
         
-        db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+        await db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
           .run(newUserId, 'Referral', referralBonusGC, referralBonusSC, 'Referral bonus for accepting invite');
           
         // Notify Referrer via socket
-        const referrer = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(referrerId) as any;
+        const referrer = await db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(referrerId) as any;
         io.to(`user-${referrerId}`).emit('balance-update', {
           gc_balance: referrer.gc_balance,
           sc_balance: referrer.sc_balance
         });
       }
-    });
-
-    transaction();
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
     
     const token = jwt.sign({ id: newUserId, email, username, role: 'user' }, JWT_SECRET, { expiresIn: '24h' });
     res.cookie('token', token, { httpOnly: true, secure: true, sameSite: 'none' });
@@ -1109,8 +1296,6 @@ app.post('/api/auth/daily-bonus', authenticate, (req: any, res) => {
     const lastClaim = user.last_bonus_claim ? new Date(user.last_bonus_claim) : null;
     
     // Check if already claimed today (within 24h)
-    // Actually, let's make it "once per calendar day" or "24h since last claim"
-    // The user said "each day", usually 24h is safer to prevent double claiming if they log in at 11:59pm and 12:01am.
     if (lastClaim && (now.getTime() - lastClaim.getTime()) < 24 * 60 * 60 * 1000) {
       const nextClaim = new Date(lastClaim.getTime() + 24 * 60 * 60 * 1000);
       return res.status(400).json({ 
@@ -1123,18 +1308,12 @@ app.post('/api/auth/daily-bonus', authenticate, (req: any, res) => {
     if (lastClaim) {
       const diffHours = (now.getTime() - lastClaim.getTime()) / (1000 * 60 * 60);
       if (diffHours < 48) {
-        // Claimed yesterday (between 24 and 48 hours ago)
         newStreak = (user.login_streak || 0) + 1;
       } else {
-        // Missed a day
         newStreak = 1;
       }
     }
 
-    // Calculate rewards
-    // Base: 10 GC, 1 SC
-    // Streak: +10 GC per day of streak (up to 7)
-    // Day 7+: 100 GC, 5 SC
     let rewardGc = 10 + (Math.min(newStreak, 7) - 1) * 10;
     let rewardSc = 1 + (Math.min(newStreak, 7) - 1) * 0.5;
     
@@ -1143,16 +1322,36 @@ app.post('/api/auth/daily-bonus', authenticate, (req: any, res) => {
       rewardSc = 5;
     }
     
-    db.transaction(() => {
-      db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ?, last_bonus_claim = ?, login_streak = ? WHERE id = ?')
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ?, last_bonus_claim = ?, login_streak = ? WHERE id = ?')
         .run(rewardGc, rewardSc, now.toISOString(), newStreak, req.user.id);
       
-      db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+      await db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
         .run(req.user.id, 'Bonus', rewardGc, rewardSc, `Daily Login Bonus (Day ${newStreak} Streak)`);
-    })();
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
     
     const updatedUser = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
     
+    // Notify via socket
+    io.to(`user-${req.user.id}`).emit('balance-update', {
+      gc_balance: updatedUser.gc_balance,
+      sc_balance: updatedUser.sc_balance
+    });
+
+    io.to(`user-${req.user.id}`).emit('notification', {
+      title: 'Daily Bonus Claimed!',
+      message: `You received ${rewardGc} GC and ${rewardSc} SC! Streak: ${newStreak} days.`,
+      type: 'success'
+    });
+
     res.json({ 
       message: 'Bonus claimed successfully!', 
       rewardGc,
@@ -1207,18 +1406,64 @@ app.post('/api/store/purchase', authenticate, (req: any, res) => {
     
     // In a real app, we would verify payment here
     
-    const transaction = db.transaction(() => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
       // Update player balance
-      db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
+      await db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
         .run(pack.gc_amount, pack.sc_amount, req.user.id);
       
       // Log transaction
-      db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+      await db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
         .run(req.user.id, 'purchase', pack.gc_amount, pack.sc_amount, `Purchased ${pack.name} via ${paymentMethod}`);
-    });
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
     
-    transaction();
-    
+    // Check for first_deposit milestone
+    const userProfile = db.prepare('SELECT referred_by, username FROM players WHERE id = ?').get(req.user.id) as any;
+    if (userProfile && userProfile.referred_by) {
+      const existing = db.prepare('SELECT id FROM referral_milestones WHERE referral_id = ? AND milestone = ?').get(req.user.id, 'first_deposit');
+      if (!existing) {
+        const rewardGC = 10000;
+        const rewardSC = 10;
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await db.prepare('INSERT INTO referral_milestones (referral_id, milestone, reward_gc, reward_sc) VALUES (?, ?, ?, ?)')
+            .run(req.user.id, 'first_deposit', rewardGC, rewardSC);
+          
+          await db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
+            .run(rewardGC, rewardSC, userProfile.referred_by);
+          
+          await db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+            .run(userProfile.referred_by, 'Referral', rewardGC, rewardSC, `First deposit bonus from referral ${userProfile.username}`);
+          await client.query('COMMIT');
+        } catch (error) {
+          await client.query('ROLLBACK');
+          throw error;
+        } finally {
+          client.release();
+        }
+
+        // Notify Referrer
+        const referrer = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(userProfile.referred_by) as any;
+        io.to(`user-${userProfile.referred_by}`).emit('balance-update', {
+          gc_balance: referrer.gc_balance,
+          sc_balance: referrer.sc_balance
+        });
+        io.to(`user-${userProfile.referred_by}`).emit('notification', {
+          title: 'Referral Bonus!',
+          message: `Your referral made their first deposit! You earned ${rewardGC} GC and ${rewardSC} SC.`,
+          type: 'success'
+        });
+      }
+    }
+
     const user = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
     
     // Notify via socket
@@ -1251,21 +1496,27 @@ app.post('/api/wallet/redeem', authenticate, (req: any, res) => {
     const fee = parseFloat(settingsMap.redemption_fee || '5');
     const payoutAmount = amountSC - fee; // Or amountSC? Prompt says "$5 service fee". Usually deducted from payout.
     
-    const transaction = db.transaction(() => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
       // Deduct SC immediately
-      db.prepare('UPDATE players SET sc_balance = sc_balance - ? WHERE id = ?')
+      await db.prepare('UPDATE players SET sc_balance = sc_balance - ? WHERE id = ?')
         .run(amountSC, req.user.id);
         
       // Create Request
-      db.prepare('INSERT INTO redemption_requests (player_id, amount_sc, payout_amount, payment_method, payment_details, status) VALUES (?, ?, ?, ?, ?, ?)')
+      await db.prepare('INSERT INTO redemption_requests (player_id, amount_sc, payout_amount, payment_method, payment_details, status) VALUES (?, ?, ?, ?, ?, ?)')
         .run(req.user.id, amountSC, payoutAmount, paymentMethod, paymentDetails, 'pending');
         
       // Log Transaction
-      db.prepare('INSERT INTO wallet_transactions (player_id, type, sc_amount, description) VALUES (?, ?, ?, ?)')
+      await db.prepare('INSERT INTO wallet_transactions (player_id, type, sc_amount, description) VALUES (?, ?, ?, ?)')
         .run(req.user.id, 'redemption_request', -amountSC, `Redemption request for ${amountSC} SC`);
-    });
-    
-    transaction();
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
     
     const updatedUser = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
     io.to(`user-${req.user.id}`).emit('balance-update', {
@@ -1299,29 +1550,68 @@ app.post('/api/user/profile/update', authenticate, (req: any, res) => {
   }
 });
 
+app.post('/api/user/avatar/update', authenticate, (req: any, res) => {
+  const { avatar_url } = req.body;
+  try {
+    db.prepare('UPDATE players SET avatar_url = ? WHERE id = ?').run(avatar_url, req.user.id);
+    res.json({ success: true, avatar_url });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Seed Games
-const seedGames = () => {
+const seedGames = async () => {
   const games = [
-    { name: 'Krazy Slots', type: 'slots', slug: 'krazy-slots', rtp: 96.5, min_bet: 1, max_bet: 1000, image_url: 'https://picsum.photos/seed/slots/400/300' },
-    { name: 'Neon Dice', type: 'dice', slug: 'neon-dice', rtp: 98.0, min_bet: 1, max_bet: 5000, image_url: 'https://picsum.photos/seed/dice/400/300' },
-    { name: 'Scratch Tickets', type: 'scratch', slug: 'scratch-tickets', rtp: 94.0, min_bet: 0.5, max_bet: 5, image_url: 'https://picsum.photos/seed/scratch/400/300' },
-    { name: 'Pull Tabs', type: 'pulltab', slug: 'pull-tabs', rtp: 94.0, min_bet: 0.5, max_bet: 5, image_url: 'https://picsum.photos/seed/pulltab/400/300' },
-    { name: 'Krazy Crash', type: 'crash', slug: 'krazy-crash', rtp: 97.0, min_bet: 1, max_bet: 1000, image_url: 'https://picsum.photos/seed/crash/400/300' },
+    { name: 'Krazy Slots', type: 'slots', slug: 'krazy-slots', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/slots/400/300', theme: 'classic' },
+    { name: 'Krazy Sweets', type: 'slots', slug: 'krazy-sweets', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/sweets/400/300', theme: 'sweets' },
+    { name: 'Dog House Krazy', type: 'slots', slug: 'dog-house-krazy', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/dog/400/300', theme: 'dog' },
+    { name: 'Gates of Krazy', type: 'slots', slug: 'gates-of-krazy', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/gates/400/300', theme: 'gates' },
+    { name: 'Krazy Rush', type: 'slots', slug: 'krazy-rush', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/rush/400/300', theme: 'rush' },
+    { name: 'Big Bass Krazy', type: 'slots', slug: 'big-bass-krazy', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/bass/400/300', theme: 'bass' },
+    { name: 'Krazy Wolf', type: 'slots', slug: 'krazy-wolf', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/wolf/400/300', theme: 'wolf' },
+    { name: 'Krazy Buffalo', type: 'slots', slug: 'krazy-buffalo', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/buffalo/400/300', theme: 'buffalo' },
+    { name: 'Krazy Rhino', type: 'slots', slug: 'krazy-rhino', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/rhino/400/300', theme: 'rhino' },
+    { name: 'Krazy Gems', type: 'slots', slug: 'krazy-gems', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/gems/400/300', theme: 'gems' },
+    { name: 'Krazy Joker', type: 'slots', slug: 'krazy-joker', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/joker/400/300', theme: 'joker' },
+    { name: 'Krazy Fruits', type: 'slots', slug: 'krazy-fruits', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/fruits/400/300', theme: 'fruits' },
+    { name: 'Krazy Gold', type: 'slots', slug: 'krazy-gold', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/gold/400/300', theme: 'gold' },
+    { name: 'Krazy Knights', type: 'slots', slug: 'krazy-knights', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/knights/400/300', theme: 'knights' },
+    { name: 'Krazy Leprechaun', type: 'slots', slug: 'krazy-leprechaun', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/leprechaun/400/300', theme: 'leprechaun' },
+    { name: 'Krazy Madame', type: 'slots', slug: 'krazy-madame', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/madame/400/300', theme: 'madame' },
+    { name: 'Krazy Mustang', type: 'slots', slug: 'krazy-mustang', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/mustang/400/300', theme: 'mustang' },
+    { name: 'Krazy Panda', type: 'slots', slug: 'krazy-panda', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/panda/400/300', theme: 'panda' },
+    { name: 'Krazy Princess', type: 'slots', slug: 'krazy-princess', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/princess/400/300', theme: 'princess' },
+    { name: 'Krazy Safari', type: 'slots', slug: 'krazy-safari', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/safari/400/300', theme: 'safari' },
+    { name: 'Krazy Shark', type: 'slots', slug: 'krazy-shark', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/shark/400/300', theme: 'shark' },
+    { name: 'Krazy Spartan', type: 'slots', slug: 'krazy-spartan', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/spartan/400/300', theme: 'spartan' },
+    { name: 'Krazy Tiki', type: 'slots', slug: 'krazy-tiki', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/tiki/400/300', theme: 'tiki' },
+    { name: 'Krazy Vampire', type: 'slots', slug: 'krazy-vampire', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/vampire/400/300', theme: 'vampire' },
+    { name: 'Krazy Viking', type: 'slots', slug: 'krazy-viking', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/viking/400/300', theme: 'viking' },
+    { name: 'Krazy Zeus', type: 'slots', slug: 'krazy-zeus', rtp: 96.5, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/zeus/400/300', theme: 'zeus' },
+    { name: 'Neon Dice', type: 'dice', slug: 'neon-dice', rtp: 98.0, min_bet: 1, max_bet: 5000, thumbnail_url: 'https://picsum.photos/seed/dice/400/300', theme: 'classic' },
+    { name: 'Scratch Tickets', type: 'scratch', slug: 'scratch-tickets', rtp: 94.0, min_bet: 0.5, max_bet: 5, thumbnail_url: 'https://picsum.photos/seed/scratch/400/300', theme: 'classic' },
+    { name: 'Pull Tabs', type: 'pulltab', slug: 'pull-tabs', rtp: 94.0, min_bet: 0.5, max_bet: 5, thumbnail_url: 'https://picsum.photos/seed/pulltab/400/300', theme: 'classic' },
+    { name: 'Krazy Crash', type: 'crash', slug: 'krazy-crash', rtp: 97.0, min_bet: 1, max_bet: 1000, thumbnail_url: 'https://picsum.photos/seed/crash/400/300', theme: 'classic' },
   ];
   
-  const insert = db.prepare('INSERT OR IGNORE INTO games (name, type, slug, rtp, min_bet, max_bet, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)');
-  games.forEach(g => insert.run(g.name, g.type, g.slug, g.rtp, g.min_bet, g.max_bet, g.image_url));
+  const insert = db.prepare('INSERT INTO games (name, type, slug, rtp, min_bet, max_bet, thumbnail_url, theme) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (slug) DO NOTHING');
+  for (const g of games) {
+    await insert.run(g.name, g.type, g.slug, g.rtp, g.min_bet, g.max_bet, g.thumbnail_url, g.theme);
+  }
 };
 
-const seedAchievements = () => {
+const seedAchievements = async () => {
   const achievements = [
     { name: 'First Win', description: 'Win your first game', icon: '🏆', requirement_type: 'win_count', requirement_value: 1 },
     { name: 'High Roller', description: 'Wager a total of 10,000 GC', icon: '💎', requirement_type: 'total_wagered', requirement_value: 10000 },
     { name: 'Lucky Strike', description: 'Win a multiplier of 50x or more', icon: '⚡', requirement_type: 'max_multiplier', requirement_value: 50 },
   ];
   
-  const insert = db.prepare('INSERT OR IGNORE INTO achievements (name, description, icon, requirement_type, requirement_value) VALUES (?, ?, ?, ?, ?)');
-  achievements.forEach(a => insert.run(a.name, a.description, a.icon, a.requirement_type, a.requirement_value));
+  const insert = db.prepare('INSERT INTO achievements (name, description, icon, requirement_type, requirement_value) VALUES (?, ?, ?, ?, ?) ON CONFLICT (name) DO NOTHING');
+  for (const a of achievements) {
+    await insert.run(a.name, a.description, a.icon, a.requirement_type, a.requirement_value);
+  }
 };
 
 const seedAdmin = async () => {
@@ -1329,20 +1619,20 @@ const seedAdmin = async () => {
   const adminUsername = 'admin';
   const adminPassword = 'admin123';
   
-  const existingAdmin = db.prepare('SELECT id FROM players WHERE email = ?').get(adminEmail);
+  const existingAdmin = await db.prepare('SELECT id FROM players WHERE email = ?').get(adminEmail);
   
   if (!existingAdmin) {
     const passwordHash = await bcrypt.hash(adminPassword, 12);
-    db.prepare("INSERT INTO players (email, username, password_hash, gc_balance, sc_balance, role) VALUES (?, ?, ?, ?, ?, 'admin')")
+    await db.prepare("INSERT INTO players (email, username, password_hash, gc_balance, sc_balance, role) VALUES (?, ?, ?, ?, ?, 'admin')")
       .run(adminEmail, adminUsername, passwordHash, 1000000, 1000);
     console.log('Admin user created successfully');
   } else {
     // Ensure admin role is set for existing admin
-    db.prepare("UPDATE players SET role = 'admin' WHERE email = ?").run(adminEmail);
+    await db.prepare("UPDATE players SET role = 'admin' WHERE email = ?").run(adminEmail);
   }
 };
 
-const seedTournaments = () => {
+const seedTournaments = async () => {
   const now = new Date();
   const oneDay = 24 * 60 * 60 * 1000;
   
@@ -1371,17 +1661,19 @@ const seedTournaments = () => {
     }
   ];
   
-  const insert = db.prepare('INSERT OR IGNORE INTO tournaments (name, game_slug, start_time, end_time, entry_fee, prize_pool, currency, status, scoring_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+  const insert = db.prepare('INSERT INTO tournaments (name, game_slug, start_time, end_time, entry_fee, prize_pool, currency, status, scoring_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (name) DO NOTHING');
   
   // Check if tournaments exist to avoid duplicates on restart
-  const count = db.prepare('SELECT COUNT(*) as count FROM tournaments').get() as any;
+  const count = await db.prepare('SELECT COUNT(*) as count FROM tournaments').get() as any;
   if (count.count === 0) {
-    tournaments.forEach(t => insert.run(t.name, t.game_slug, t.start_time, t.end_time, t.entry_fee, t.prize_pool, t.currency, t.status, t.scoring_type));
+    for (const t of tournaments) {
+      await insert.run(t.name, t.game_slug, t.start_time, t.end_time, t.entry_fee, t.prize_pool, t.currency, t.status, t.scoring_type);
+    }
     console.log('Tournaments seeded');
   }
 };
 
-const seedTicketTypes = () => {
+const seedTicketTypes = async () => {
   const types = [
     { type: 'scratch', name: 'Neon Nights', description: 'Scratch to reveal neon prizes!', price_sc: 1.00, theme_images: JSON.stringify(['https://picsum.photos/seed/neon/800/600']) },
     { type: 'scratch', name: 'Golden Galaxy', description: 'The universe is full of gold!', price_sc: 5.00, theme_images: JSON.stringify(['https://picsum.photos/seed/galaxy/800/600']) },
@@ -1389,19 +1681,22 @@ const seedTicketTypes = () => {
     { type: 'pulltab', name: 'Cherry Blast', description: 'Classic fruit machine pull tabs.', price_sc: 2.00, theme_images: JSON.stringify(['https://picsum.photos/seed/cherry/800/600']) },
   ];
 
-  const insert = db.prepare('INSERT OR IGNORE INTO ticket_types (type, name, description, price_sc, theme_images) VALUES (?, ?, ?, ?, ?)');
-  const count = db.prepare('SELECT COUNT(*) as count FROM ticket_types').get() as any;
+  const insert = db.prepare('INSERT INTO ticket_types (type, name, description, price_sc, theme_images, top_prize_sc, total_tickets, remaining_tickets) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (name) DO NOTHING');
+  const count = await db.prepare('SELECT COUNT(*) as count FROM ticket_types').get() as any;
   if (count.count === 0) {
-    types.forEach(t => insert.run(t.type, t.name, t.description, t.price_sc, t.theme_images));
+    for (const t of types) {
+      await insert.run(t.type, t.name, t.description, t.price_sc, t.theme_images, 100, 1000, 1000);
+    }
     console.log('Ticket types seeded');
   }
 };
 
-seedGames();
-seedAchievements();
-seedAdmin();
-seedTournaments();
-seedTicketTypes();
+// Seeding is handled in startServer()
+// seedGames();
+// seedAchievements();
+// seedAdmin();
+// seedTournaments();
+// seedTicketTypes();
 
 // Tournaments Endpoints
 app.get('/api/tournaments', (req: any, res) => {
@@ -1414,7 +1709,7 @@ app.get('/api/tournaments', (req: any, res) => {
       END as is_joined
       FROM tournaments t
       LEFT JOIN tournament_participants tp ON t.id = tp.tournament_id
-      WHERE t.status != 'completed' OR t.end_time > datetime('now', '-1 day')
+      WHERE t.status != 'completed' OR t.end_time > NOW() - INTERVAL '1 day'
       GROUP BY t.id
       ORDER BY t.status = 'active' DESC, t.start_time ASC
     `).all(req.user?.id || null, req.user?.id || null);
@@ -1463,15 +1758,17 @@ app.post('/api/tournaments/:id/join', authenticate, (req: any, res) => {
     
     if (balance < tournament.entry_fee) return res.status(400).json({ error: 'Insufficient balance' });
     
-    const transaction = db.transaction(() => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
       if (tournament.entry_fee > 0) {
         if (tournament.currency === 'gc') {
-          db.prepare('UPDATE players SET gc_balance = gc_balance - ? WHERE id = ?').run(tournament.entry_fee, req.user.id);
+          await db.prepare('UPDATE players SET gc_balance = gc_balance - ? WHERE id = ?').run(tournament.entry_fee, req.user.id);
         } else {
-          db.prepare('UPDATE players SET sc_balance = sc_balance - ? WHERE id = ?').run(tournament.entry_fee, req.user.id);
+          await db.prepare('UPDATE players SET sc_balance = sc_balance - ? WHERE id = ?').run(tournament.entry_fee, req.user.id);
         }
         
-        db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+        await db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
           .run(req.user.id, 'tournament_entry', 
             tournament.currency === 'gc' ? -tournament.entry_fee : 0,
             tournament.currency === 'sc' ? -tournament.entry_fee : 0,
@@ -1479,11 +1776,15 @@ app.post('/api/tournaments/:id/join', authenticate, (req: any, res) => {
           );
       }
       
-      db.prepare('INSERT INTO tournament_participants (tournament_id, player_id) VALUES (?, ?)')
+      await db.prepare('INSERT INTO tournament_participants (tournament_id, player_id) VALUES (?, ?)')
         .run(id, req.user.id);
-    });
-    
-    transaction();
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
     
     // Notify via socket
     const updatedUser = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(req.user.id) as any;
@@ -1534,6 +1835,56 @@ const updateTournamentScore = (userId: number, gameSlug: string, betAmount: numb
     }
   } catch (error) {
     console.error('Error updating tournament score:', error);
+  }
+};
+
+const checkReferralWageringMilestones = (playerId: number) => {
+  try {
+    const player = db.prepare('SELECT id, username, referred_by, total_wagered FROM players WHERE id = ?').get(playerId) as any;
+    if (!player || !player.referred_by) return;
+
+    const milestones = [
+      { id: 'wagering_100', threshold: 100, rewardGC: 5000, rewardSC: 5 },
+      { id: 'wagering_1000', threshold: 1000, rewardGC: 25000, rewardSC: 25 }
+    ];
+
+    milestones.forEach(m => {
+      const existing = db.prepare('SELECT id FROM referral_milestones WHERE referral_id = ? AND milestone = ?').get(playerId, m.id);
+      if (!existing && player.total_wagered >= m.threshold) {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await db.prepare('INSERT INTO referral_milestones (referral_id, milestone, reward_gc, reward_sc) VALUES (?, ?, ?, ?)')
+            .run(playerId, m.id, m.rewardGC, m.rewardSC);
+          
+          await db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
+            .run(m.rewardGC, m.rewardSC, player.referred_by);
+          
+          await db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+            .run(player.referred_by, 'Referral', m.rewardGC, m.rewardSC, `Referral wagering milestone (${m.threshold} SC) reached by ${player.username}`);
+          await client.query('COMMIT');
+        } catch (error) {
+          await client.query('ROLLBACK');
+          throw error;
+        } finally {
+          client.release();
+        }
+
+        // Notify Referrer
+        const referrer = db.prepare('SELECT gc_balance, sc_balance FROM players WHERE id = ?').get(player.referred_by) as any;
+        io.to(`user-${player.referred_by}`).emit('balance-update', {
+          gc_balance: referrer.gc_balance,
+          sc_balance: referrer.sc_balance
+        });
+        io.to(`user-${player.referred_by}`).emit('notification', {
+          title: 'Referral Milestone!',
+          message: `Your referral ${player.username} reached the ${m.threshold} SC wagering milestone! You earned ${m.rewardGC} GC and ${m.rewardSC} SC.`,
+          type: 'success'
+        });
+      }
+    });
+  } catch (error) {
+    console.error('Error checking referral milestones:', error);
   }
 };
 
@@ -1613,52 +1964,82 @@ app.post('/api/games/slots/spin', authenticate, (req: any, res) => {
     const isWin = random < (game.rtp / 100);
     let winAmount = 0;
     let multiplier = 0;
+    let reels = [
+      Math.floor(Math.random() * 7),
+      Math.floor(Math.random() * 7),
+      Math.floor(Math.random() * 7)
+    ];
     
     if (isWin) {
       // Simple multiplier logic
       const winRandom = Math.random();
-      if (winRandom < 0.01) multiplier = 50; // Big win
-      else if (winRandom < 0.1) multiplier = 10; // Medium win
-      else multiplier = 2; // Small win
+      let winSymbol = 0;
+      if (winRandom < 0.01) {
+        multiplier = 50; // Big win
+        winSymbol = 6; // Highest paying symbol (e.g., 7️⃣)
+      } else if (winRandom < 0.1) {
+        multiplier = 10; // Medium win
+        winSymbol = Math.floor(Math.random() * 3) + 3; // Symbols 3, 4, 5
+      } else {
+        multiplier = 2; // Small win
+        winSymbol = Math.floor(Math.random() * 3); // Symbols 0, 1, 2
+      }
       
       winAmount = betAmount * multiplier;
+      reels = [winSymbol, winSymbol, winSymbol];
+    } else {
+      // For a loss, ensure they are not all the same
+      while (reels[0] === reels[1] && reels[1] === reels[2]) {
+        reels = [
+          Math.floor(Math.random() * 7),
+          Math.floor(Math.random() * 7),
+          Math.floor(Math.random() * 7)
+        ];
+      }
     }
     
     const newBalance = balance - betAmount + winAmount;
     
-    const transaction = db.transaction(() => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
       // Update balance
       if (currency === 'gc') {
-        db.prepare('UPDATE players SET gc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
+        await db.prepare('UPDATE players SET gc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
           .run(newBalance, betAmount, req.user.id);
       } else {
-        db.prepare('UPDATE players SET sc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
+        await db.prepare('UPDATE players SET sc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
           .run(newBalance, betAmount, req.user.id);
       }
       
       // Log result
-      db.prepare('INSERT INTO game_results (player_id, game_id, bet_amount, win_amount, currency, multiplier, result_data) VALUES (?, ?, ?, ?, ?, ?, ?)')
-        .run(req.user.id, gameId, betAmount, winAmount, currency, multiplier, JSON.stringify({ random, isWin }));
+      await db.prepare('INSERT INTO game_results (player_id, game_id, bet_amount, win_amount, currency, multiplier, result_data) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(req.user.id, gameId, betAmount, winAmount, currency, multiplier, JSON.stringify({ random, isWin, reels }));
         
       // Update Tournament Scores
       updateTournamentScore(req.user.id, 'krazy-slots', betAmount, winAmount, multiplier, currency);
       
       // Update Challenge Progress
       updateChallengeProgress(req.user.id, gameId, betAmount, winAmount, currency, multiplier);
-    });
-    
-    transaction();
+
+      // Update Referral Milestones (only for SC wagering)
+      if (currency === 'sc') {
+        checkReferralWageringMilestones(req.user.id);
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
     
     res.json({
       isWin,
       winAmount,
       multiplier,
       newBalance,
-      reels: [
-        Math.floor(Math.random() * 7),
-        Math.floor(Math.random() * 7),
-        Math.floor(Math.random() * 7)
-      ]
+      reels
     });
     
     // Notify via socket for real-time balance update
@@ -1699,22 +2080,33 @@ app.post('/api/games/crash/play', authenticate, (req: any, res) => {
     
     const newBalance = balance - betAmount + winAmount;
     
-    const transaction = db.transaction(() => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
       if (currency === 'gc') {
-        db.prepare('UPDATE players SET gc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
+        await db.prepare('UPDATE players SET gc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
           .run(newBalance, betAmount, req.user.id);
       } else {
-        db.prepare('UPDATE players SET sc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
+        await db.prepare('UPDATE players SET sc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
           .run(newBalance, betAmount, req.user.id);
       }
       
-      db.prepare('INSERT INTO game_results (player_id, game_id, bet_amount, win_amount, currency, multiplier, result_data) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      await db.prepare('INSERT INTO game_results (player_id, game_id, bet_amount, win_amount, currency, multiplier, result_data) VALUES (?, ?, ?, ?, ?, ?, ?)')
         .run(req.user.id, gameId, betAmount, winAmount, currency, isWin ? multiplier : 0, JSON.stringify({ crashPoint, autoCashout, isWin }));
       
       updateChallengeProgress(req.user.id, gameId, betAmount, winAmount, currency, isWin ? multiplier : 0);
-    });
-    
-    transaction();
+
+      // Update Referral Milestones (only for SC wagering)
+      if (currency === 'sc') {
+        checkReferralWageringMilestones(req.user.id);
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
     
     res.json({
       isWin,
@@ -1768,16 +2160,18 @@ app.post('/api/games/dice/roll', authenticate, (req: any, res) => {
     
     const newBalance = balance - betAmount + winAmount;
     
-    const transaction = db.transaction(() => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
       if (currency === 'gc') {
-        db.prepare('UPDATE players SET gc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
+        await db.prepare('UPDATE players SET gc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
           .run(newBalance, betAmount, req.user.id);
       } else {
-        db.prepare('UPDATE players SET sc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
+        await db.prepare('UPDATE players SET sc_balance = ?, total_wagered = total_wagered + ? WHERE id = ?')
           .run(newBalance, betAmount, req.user.id);
       }
       
-      db.prepare('INSERT INTO game_results (player_id, game_id, bet_amount, win_amount, currency, multiplier, result_data) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      await db.prepare('INSERT INTO game_results (player_id, game_id, bet_amount, win_amount, currency, multiplier, result_data) VALUES (?, ?, ?, ?, ?, ?, ?)')
         .run(req.user.id, gameId, betAmount, winAmount, currency, multiplier, JSON.stringify({ roll, target, type, isWin }));
         
       // Update Tournament Scores
@@ -1785,9 +2179,18 @@ app.post('/api/games/dice/roll', authenticate, (req: any, res) => {
       
       // Update Challenge Progress
       updateChallengeProgress(req.user.id, gameId, betAmount, winAmount, currency, multiplier);
-    });
-    
-    transaction();
+
+      // Update Referral Milestones (only for SC wagering)
+      if (currency === 'sc') {
+        checkReferralWageringMilestones(req.user.id);
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
     
     res.json({
       isWin,
@@ -1812,13 +2215,14 @@ app.get('/api/ai/challenges', authenticate, async (req: any, res) => {
   try {
     const userId = req.user.id;
     
-    // Check for active challenges
+    // Check for active challenges for today
+    const today = new Date().toISOString().split('T')[0];
     const activeChallenges = db.prepare(`
       SELECT c.*, pc.progress, pc.status 
       FROM player_challenges pc
       JOIN challenges c ON pc.challenge_id = c.id
-      WHERE pc.player_id = ? AND pc.status = 'active'
-    `).all(userId);
+      WHERE pc.player_id = ? AND pc.status = 'active' AND date(pc.started_at) = date(?)
+    `).all(userId, today);
 
     if (activeChallenges.length > 0) {
       return res.json({ challenges: activeChallenges });
@@ -1832,7 +2236,7 @@ app.get('/api/ai/challenges', authenticate, async (req: any, res) => {
     User Profile: ${JSON.stringify({ username: user.username, vip_status: user.vip_status, total_wagered: user.total_wagered })}
     Recent Wins: ${JSON.stringify(recentWins)}
     
-    Create 3 unique, personalized game challenges for this user. 
+    Create 3-5 unique, personalized daily game challenges for this user. 
     Challenges should adapt to their skill level (total wagered).
     
     Requirement Types:
@@ -1840,11 +2244,16 @@ app.get('/api/ai/challenges', authenticate, async (req: any, res) => {
     - 'total_wager': Wager a total of X GC/SC
     - 'specific_game_win': Win X times on a specific game
     - 'multiplier': Get a win multiplier of at least X
+    - 'play_count': Play X games total
+    
+    Examples:
+    - 'Play 5 slot spins' rewarding 50 GC
+    - 'Win a game with a 2x multiplier' rewarding 25 SC
     
     Difficulty: 1 (Easy) to 5 (Hard).
     Rewards: 
-    - GC: 1000 to 50000
-    - SC: 0.1 to 10.0 (only for higher difficulty)
+    - GC: 50 to 50000
+    - SC: 0.1 to 25.0 (only for higher difficulty)
     
     Return a JSON array of objects with:
     - title: Catchy title
@@ -1854,14 +2263,15 @@ app.get('/api/ai/challenges', authenticate, async (req: any, res) => {
     - reward_gc: GC reward
     - reward_sc: SC reward
     - difficulty: 1-5
-    - expires_in_hours: 24 to 72
+    - expires_in_hours: 24
     `;
 
     if (!ai) {
       // Fallback
       const fallbackChallenges = [
-        { title: 'Slot Starter', description: 'Win 5 times on Krazy Slots', requirement_type: 'specific_game_win', requirement_value: 5, reward_gc: 1000, reward_sc: 0, difficulty: 1, expires_in_hours: 24 },
-        { title: 'High Roller Lite', description: 'Wager 5000 GC total', requirement_type: 'total_wager', requirement_value: 5000, reward_gc: 2500, reward_sc: 0, difficulty: 2, expires_in_hours: 48 }
+        { title: 'Slot Starter', description: 'Play 5 slot spins', requirement_type: 'play_count', requirement_value: 5, reward_gc: 50, reward_sc: 0, difficulty: 1, expires_in_hours: 24 },
+        { title: 'Multiplier Master', description: 'Win a game with a 2x multiplier', requirement_type: 'multiplier', requirement_value: 2, reward_gc: 0, reward_sc: 25, difficulty: 3, expires_in_hours: 24 },
+        { title: 'High Roller Lite', description: 'Wager 5000 GC total', requirement_type: 'total_wager', requirement_value: 5000, reward_gc: 2500, reward_sc: 0, difficulty: 2, expires_in_hours: 24 }
       ];
       
       const transaction = db.transaction(() => {
@@ -1878,8 +2288,8 @@ app.get('/api/ai/challenges', authenticate, async (req: any, res) => {
         SELECT c.*, pc.progress, pc.status 
         FROM player_challenges pc
         JOIN challenges c ON pc.challenge_id = c.id
-        WHERE pc.player_id = ? AND pc.status = 'active'
-      `).all(userId);
+        WHERE pc.player_id = ? AND pc.status = 'active' AND date(pc.started_at) = date(?)
+      `).all(userId, today);
       
       return res.json({ challenges: newChallenges });
     }
@@ -1892,22 +2302,29 @@ app.get('/api/ai/challenges', authenticate, async (req: any, res) => {
 
     const challenges = JSON.parse(response.text || '[]');
     
-    const transaction = db.transaction(() => {
-      challenges.forEach((c: any) => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const c of challenges) {
         const expiresAt = new Date(Date.now() + (c.expires_in_hours || 24) * 60 * 60 * 1000).toISOString();
-        const result = db.prepare('INSERT INTO challenges (title, description, requirement_type, requirement_value, reward_gc, reward_sc, difficulty, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(c.title, c.description, c.requirement_type, c.requirement_value, c.reward_gc, c.reward_sc, c.difficulty, expiresAt);
-        db.prepare('INSERT INTO player_challenges (player_id, challenge_id) VALUES (?, ?)').run(userId, result.lastInsertRowid);
-      });
-    });
-    transaction();
+        const result = await db.prepare('INSERT INTO challenges (title, description, requirement_type, requirement_value, reward_gc, reward_sc, difficulty, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id')
+          .get(c.title, c.description, c.requirement_type, c.requirement_value, c.reward_gc, c.reward_sc, c.difficulty, expiresAt) as any;
+        await db.prepare('INSERT INTO player_challenges (player_id, challenge_id) VALUES (?, ?)').run(userId, result.id);
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
 
     const newChallenges = db.prepare(`
       SELECT c.*, pc.progress, pc.status 
       FROM player_challenges pc
       JOIN challenges c ON pc.challenge_id = c.id
-      WHERE pc.player_id = ? AND pc.status = 'active'
-    `).all(userId);
+      WHERE pc.player_id = ? AND pc.status = 'active' AND date(pc.started_at) = date(?)
+    `).all(userId, today);
 
     res.json({ challenges: newChallenges });
   } catch (error: any) {
@@ -1927,6 +2344,136 @@ app.get('/api/stats/wagered-history', authenticate, (req: any, res) => {
       LIMIT 30
     `).all(req.user.id);
     res.json({ history });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Social Feed Endpoints
+app.get('/api/social/feed', authenticate, (req: any, res) => {
+  try {
+    const posts = db.prepare(`
+      SELECT 
+        p.*, 
+        u.username, 
+        u.avatar_url,
+        (SELECT COUNT(*) FROM post_likes WHERE post_id = p.id) as likes_count,
+        (SELECT COUNT(*) FROM post_comments WHERE post_id = p.id) as comments_count,
+        (SELECT COUNT(*) FROM post_likes WHERE post_id = p.id AND player_id = ?) as is_liked,
+        gr.game_id,
+        gr.win_amount,
+        gr.currency as win_currency,
+        g.name as game_name
+      FROM posts p
+      JOIN players u ON p.player_id = u.id
+      LEFT JOIN game_results gr ON p.game_result_id = gr.id
+      LEFT JOIN games g ON gr.game_id = g.id
+      ORDER BY p.created_at DESC
+      LIMIT 50
+    `).all(req.user.id);
+
+    res.json({ posts });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/social/posts', authenticate, (req: any, res) => {
+  const { content, type, game_result_id } = req.body;
+  try {
+    const result = db.prepare('INSERT INTO posts (player_id, content, type, game_result_id) VALUES (?, ?, ?, ?)')
+      .run(req.user.id, content, type || 'update', game_result_id || null);
+    
+    const newPost = db.prepare(`
+      SELECT p.*, u.username, u.avatar_url 
+      FROM posts p 
+      JOIN players u ON p.player_id = u.id 
+      WHERE p.id = ?
+    `).get(result.lastInsertRowid);
+
+    res.json({ post: newPost });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/social/posts/:id/like', authenticate, (req: any, res) => {
+  const postId = req.params.id;
+  try {
+    const existing = db.prepare('SELECT id FROM post_likes WHERE post_id = ? AND player_id = ?').get(postId, req.user.id);
+    if (existing) {
+      db.prepare('DELETE FROM post_likes WHERE post_id = ? AND player_id = ?').run(postId, req.user.id);
+      res.json({ liked: false });
+    } else {
+      db.prepare('INSERT INTO post_likes (post_id, player_id) VALUES (?, ?)').run(postId, req.user.id);
+      res.json({ liked: true });
+    }
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/social/posts/:id/comments', authenticate, (req: any, res) => {
+  try {
+    const comments = db.prepare(`
+      SELECT c.*, u.username, u.avatar_url 
+      FROM post_comments c 
+      JOIN players u ON c.player_id = u.id 
+      WHERE c.post_id = ? 
+      ORDER BY c.created_at ASC
+    `).all(req.params.id);
+    res.json({ comments });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/social/posts/:id/comments', authenticate, (req: any, res) => {
+  const { content } = req.body;
+  try {
+    const result = db.prepare('INSERT INTO post_comments (post_id, player_id, content) VALUES (?, ?, ?)')
+      .run(req.params.id, req.user.id, content);
+    
+    const newComment = db.prepare(`
+      SELECT c.*, u.username, u.avatar_url 
+      FROM post_comments c 
+      JOIN players u ON c.player_id = u.id 
+      WHERE c.id = ?
+    `).get(result.lastInsertRowid);
+
+    res.json({ comment: newComment });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Referral Endpoints
+app.get('/api/referrals/stats', authenticate, (req: any, res) => {
+  try {
+    const referrals = db.prepare(`
+      SELECT 
+        p.username, 
+        p.created_at as joined_at,
+        p.total_wagered,
+        (SELECT COUNT(*) FROM referral_milestones WHERE referral_id = p.id) as milestones_reached
+      FROM players p
+      WHERE p.referred_by = ?
+    `).all(req.user.id);
+
+    const totalEarned = db.prepare(`
+      SELECT SUM(reward_gc) as gc, SUM(reward_sc) as sc 
+      FROM referral_milestones rm
+      JOIN players p ON rm.referral_id = p.id
+      WHERE p.referred_by = ?
+    `).get(req.user.id);
+
+    res.json({ 
+      referrals, 
+      totalEarned: {
+        gc: totalEarned.gc || 0,
+        sc: totalEarned.sc || 0
+      }
+    });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -2118,20 +2665,27 @@ app.post('/api/friends/accept', authenticate, (req: any, res) => {
       .get(req.user.id, `%friendship with user #${request.user_id}%`) as any;
 
     if (bonusGiven.count === 0) {
-      const transaction = db.transaction(() => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
         // Bonus for both
-        db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
+        await db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
           .run(referralBonusGC, referralBonusSC, request.user_id);
-        db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
+        await db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
           .run(referralBonusGC, referralBonusSC, request.friend_id);
 
         // Log Transactions
-        db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+        await db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
           .run(request.user_id, 'Referral', referralBonusGC, referralBonusSC, `Friendship bonus for adding user #${request.friend_id}`);
-        db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+        await db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
           .run(request.friend_id, 'Referral', referralBonusGC, referralBonusSC, `Friendship bonus for adding user #${request.user_id}`);
-      });
-      transaction();
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
 
       // Notify both via socket
       [request.user_id, request.friend_id].forEach(uid => {
@@ -2211,14 +2765,21 @@ app.post('/api/admin/rain', authenticate, isAdmin, (req: any, res) => {
   const { amountGC, amountSC } = req.body;
   
   try {
-    const transaction = db.transaction(() => {
-      db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ?').run(amountGC, amountSC);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ?').run(amountGC, amountSC);
       
       // We can't easily log individual transactions for everyone in one go without a loop, 
       // but for "rain" maybe a system log is enough or we loop if user count is small.
       // For now, let's just update balances.
-    });
-    transaction();
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
     
     io.emit('notification', {
       type: 'success',
@@ -2326,8 +2887,16 @@ app.post('/api/admin/redemptions/process', authenticate, isAdmin, (req: any, res
 app.post('/api/admin/packages', authenticate, isAdmin, (req: any, res) => {
   const { id, name, gc_amount, sc_amount, price, image_url } = req.body;
   try {
-    db.prepare('INSERT OR REPLACE INTO coin_packages (id, name, gc_amount, sc_amount, price, image_url) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(id, name, gc_amount, sc_amount, price, image_url);
+    await db.prepare(`
+      INSERT INTO coin_packages (id, name, gc_amount, sc_amount, price, image_url)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT (id) DO UPDATE SET
+        name = EXCLUDED.name,
+        gc_amount = EXCLUDED.gc_amount,
+        sc_amount = EXCLUDED.sc_amount,
+        price = EXCLUDED.price,
+        image_url = EXCLUDED.image_url
+    `).run(id, name, gc_amount, sc_amount, price, image_url);
     res.json({ success: true });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -2347,12 +2916,14 @@ setInterval(() => {
     const endedTournaments = db.prepare("SELECT * FROM tournaments WHERE status = 'active' AND end_time <= ?").all(now);
     
     for (const t of endedTournaments as any[]) {
-      db.transaction(() => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
         // Mark as completed
-        db.prepare("UPDATE tournaments SET status = 'completed' WHERE id = ?").run(t.id);
+        await db.prepare("UPDATE tournaments SET status = 'completed' WHERE id = ?").run(t.id);
         
         // Distribute Prizes (Top 3 for simplicity)
-        const winners = db.prepare(`
+        const winners = await db.prepare(`
           SELECT * FROM tournament_participants 
           WHERE tournament_id = ? 
           ORDER BY score DESC 
@@ -2361,16 +2932,17 @@ setInterval(() => {
         
         const prizeDistribution = [0.5, 0.3, 0.2]; // 50%, 30%, 20%
         
-        winners.forEach((w, index) => {
+        for (let index = 0; index < winners.length; index++) {
+          const w = winners[index];
           const prize = t.prize_pool * prizeDistribution[index];
           if (prize > 0) {
             if (t.currency === 'gc') {
-              db.prepare('UPDATE players SET gc_balance = gc_balance + ? WHERE id = ?').run(prize, w.player_id);
+              await db.prepare('UPDATE players SET gc_balance = gc_balance + ? WHERE id = ?').run(prize, w.player_id);
             } else {
-              db.prepare('UPDATE players SET sc_balance = sc_balance + ? WHERE id = ?').run(prize, w.player_id);
+              await db.prepare('UPDATE players SET sc_balance = sc_balance + ? WHERE id = ?').run(prize, w.player_id);
             }
             
-            db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+            await db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
               .run(w.player_id, 'tournament_win', 
                 t.currency === 'gc' ? prize : 0,
                 t.currency === 'sc' ? prize : 0,
@@ -2383,8 +2955,14 @@ setInterval(() => {
               message: `You won ${prize} ${t.currency.toUpperCase()} in ${t.name}!`
             });
           }
-        });
-      })();
+        }
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
     }
   } catch (error) {
     console.error('Tournament Scheduler Error:', error);
@@ -2526,7 +3104,7 @@ app.post('/api/tickets/purchase', authenticate, (req: any, res) => {
     // Rate limiting check (simple version)
     const recentPurchases = db.prepare(`
       SELECT COUNT(*) as count FROM ticket_purchases 
-      WHERE player_id = ? AND created_at > datetime('now', '-1 minute')
+      WHERE player_id = ? AND created_at > NOW() - INTERVAL '1 minute'
     `).get(req.user.id) as any;
     
     if (recentPurchases.count >= 50) return res.status(429).json({ error: 'Rate limit exceeded. Max 50 tickets per minute.' });
@@ -2542,21 +3120,28 @@ app.post('/api/tickets/purchase', authenticate, (req: any, res) => {
       winAmount = parseFloat(winAmount.toFixed(2));
     }
 
-    const transaction = db.transaction(() => {
+    const client = await pool.connect();
+    let purchaseId;
+    try {
+      await client.query('BEGIN');
       // Deduct balance
-      db.prepare('UPDATE players SET sc_balance = sc_balance - ? WHERE id = ?')
+      await db.prepare('UPDATE players SET sc_balance = sc_balance - ? WHERE id = ?')
         .run(ticketType.price_sc, req.user.id);
       
       // Create purchase record
-      const result = db.prepare(`
+      const result = await db.prepare(`
         INSERT INTO ticket_purchases (player_id, ticket_type_id, cost_sc, win_amount, is_win, result_data, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(req.user.id, ticketTypeId, ticketType.price_sc, winAmount, isWin ? 1 : 0, JSON.stringify({ winAmount, isWin }), 'purchased');
+        VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id
+      `).get(req.user.id, ticketTypeId, ticketType.price_sc, winAmount, isWin ? 1 : 0, JSON.stringify({ winAmount, isWin }), 'purchased') as any;
       
-      return result.lastInsertRowid;
-    });
-
-    const purchaseId = transaction();
+      purchaseId = result.id;
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
     
     // Notify balance update
     const updatedUser = db.prepare('SELECT sc_balance, gc_balance FROM players WHERE id = ?').get(req.user.id) as any;
@@ -2603,14 +3188,22 @@ app.post('/api/tickets/claim', authenticate, (req: any, res) => {
     if (!purchase) return res.status(404).json({ error: 'Purchase not found or not in revealed state' });
     
     if (purchase.is_win === 1) {
-      db.transaction(() => {
-        db.prepare('UPDATE players SET sc_balance = sc_balance + ? WHERE id = ?')
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await db.prepare('UPDATE players SET sc_balance = sc_balance + ? WHERE id = ?')
           .run(purchase.win_amount, req.user.id);
-        db.prepare("UPDATE ticket_purchases SET status = 'claimed' WHERE id = ?").run(purchaseId);
+        await db.prepare("UPDATE ticket_purchases SET status = 'claimed' WHERE id = ?").run(purchaseId);
         
-        db.prepare('INSERT INTO wallet_transactions (player_id, type, sc_amount, description) VALUES (?, ?, ?, ?)')
+        await db.prepare('INSERT INTO wallet_transactions (player_id, type, sc_amount, description) VALUES (?, ?, ?, ?)')
           .run(req.user.id, 'ticket_win', purchase.win_amount, `Won ${purchase.win_amount} SC on ticket #${purchaseId}`);
-      })();
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
       
       const updatedUser = db.prepare('SELECT sc_balance, gc_balance FROM players WHERE id = ?').get(req.user.id) as any;
       io.to(`user-${req.user.id}`).emit('balance-update', updatedUser);
@@ -2640,13 +3233,21 @@ app.post('/api/tickets/save', authenticate, (req: any, res) => {
     const images = JSON.parse(purchase.theme_images || '[]');
     const imageUrl = images[0] || '';
 
-    db.transaction(() => {
-      db.prepare("UPDATE ticket_purchases SET status = 'saved' WHERE id = ?").run(purchaseId);
-      db.prepare(`
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await db.prepare("UPDATE ticket_purchases SET status = 'saved' WHERE id = ?").run(purchaseId);
+      await db.prepare(`
         INSERT INTO user_saved_wins (player_id, purchase_id, ticket_name, amount_won, image_url)
         VALUES (?, ?, ?, ?, ?)
       `).run(req.user.id, purchaseId, purchase.ticket_name, purchase.win_amount, imageUrl);
-    })();
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
 
     res.json({ success: true });
   } catch (error: any) {
@@ -2668,9 +3269,11 @@ app.post('/api/user/social/connect', authenticate, (req: any, res) => {
   const { platform, platform_username } = req.body;
   
   try {
-    db.prepare(`
-      INSERT OR REPLACE INTO social_links (player_id, platform, platform_username)
+    await db.prepare(`
+      INSERT INTO social_links (player_id, platform, platform_username)
       VALUES (?, ?, ?)
+      ON CONFLICT (player_id, platform) DO UPDATE SET
+        platform_username = EXCLUDED.platform_username
     `).run(req.user.id, platform, platform_username);
     
     res.json({ success: true });
@@ -2769,21 +3372,29 @@ app.post('/api/bonuses/claim', authenticate, (req: any, res) => {
     const expiresAt = bonus.expiration_days ? new Date(Date.now() + bonus.expiration_days * 24 * 60 * 60 * 1000).toISOString() : null;
     const wageringTarget = (bonus.reward_sc || 0) * (bonus.wagering_requirement || 0);
 
-    db.transaction(() => {
-      db.prepare(`
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await db.prepare(`
         INSERT INTO player_bonuses (player_id, bonus_id, wagering_target, expires_at)
         VALUES (?, ?, ?, ?)
       `).run(req.user.id, bonus.id, wageringTarget, expiresAt);
 
       // If it's a direct reward (no deposit needed), add it now
       if (bonus.type === 'loyalty' || bonus.type === 'free_spins') {
-        db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
+        await db.prepare('UPDATE players SET gc_balance = gc_balance + ?, sc_balance = sc_balance + ? WHERE id = ?')
           .run(bonus.reward_gc, bonus.reward_sc, req.user.id);
         
-        db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
+        await db.prepare('INSERT INTO wallet_transactions (player_id, type, gc_amount, sc_amount, description) VALUES (?, ?, ?, ?, ?)')
           .run(req.user.id, 'Bonus', bonus.reward_gc, bonus.reward_sc, `Claimed bonus: ${bonus.name}`);
       }
-    })();
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
 
     res.json({ success: true });
   } catch (error: any) {
@@ -3072,7 +3683,7 @@ app.get('/api/user/referrals', authenticate, (req: any, res) => {
       SELECT id, username, avatar_url, created_at, kyc_status,
       (SELECT SUM(bet_amount) FROM game_results WHERE player_id = players.id AND currency = 'sc') as total_wagered_sc,
       CASE 
-        WHEN last_login > datetime('now', '-7 days') THEN 'active'
+        WHEN last_login > NOW() - INTERVAL '7 days' THEN 'active'
         ELSE 'inactive'
       END as status
       FROM players

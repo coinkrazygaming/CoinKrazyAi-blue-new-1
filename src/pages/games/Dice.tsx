@@ -11,12 +11,14 @@ import {
   ChevronLeft,
   Dices,
   ArrowRight,
-  TrendingUp
+  TrendingUp,
+  Share2
 } from 'lucide-react';
 import { Button } from '../../components/ui/Button';
 import { Card, CardContent } from '../../components/ui/Card';
 import { useAuth } from '../../contexts/AuthContext';
 import { cn } from '../../lib/utils';
+import { toast } from 'sonner';
 
 import GameChat from '../../components/GameChat';
 
@@ -31,6 +33,7 @@ export default function Dice() {
   const [lastRoll, setLastRoll] = React.useState<number | null>(null);
   const [isRolling, setIsRolling] = React.useState(false);
   const [lastResult, setLastResult] = React.useState<any>(null);
+  const [isSharing, setIsSharing] = React.useState(false);
 
   const { data: gamesData } = useQuery({
     queryKey: ['games'],
@@ -68,11 +71,43 @@ export default function Dice() {
     }
   });
 
+  const shareMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch('/api/social/posts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: `Just won ${lastResult.winAmount.toFixed(2)} ${currency.toUpperCase()} on ${game.name}! 🎲🔥`,
+          type: 'win_share',
+          game_id: game.id,
+          win_amount: lastResult.winAmount,
+          currency: currency
+        })
+      });
+      return res.json();
+    },
+    onSuccess: () => {
+      toast.success('Win shared to social feed!');
+      setIsSharing(false);
+    },
+    onError: () => {
+      toast.error('Failed to share win');
+      setIsSharing(false);
+    }
+  });
+
   const handleRoll = () => {
     if (isRolling || !game) return;
     setIsRolling(true);
     setLastResult(null);
     rollMutation.mutate();
+  };
+
+  const handleShareWin = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (isSharing || !lastResult?.isWin) return;
+    setIsSharing(true);
+    shareMutation.mutate();
   };
 
   const winChance = type === 'over' ? (100 - target) : target;
@@ -267,8 +302,21 @@ export default function Dice() {
                 exit={{ opacity: 0, scale: 0.5 }}
                 className="absolute inset-0 flex items-center justify-center z-40 pointer-events-none"
               >
-                <div className="bg-emerald-600 text-white px-8 py-4 rounded-full shadow-2xl shadow-emerald-600/50 border-4 border-white/20 animate-bounce">
-                  <h2 className="text-4xl font-black italic tracking-tighter">WINNER!</h2>
+                <div className="bg-emerald-600 text-white px-8 py-4 rounded-3xl shadow-2xl shadow-emerald-600/50 border-4 border-white/20 animate-bounce flex flex-col items-center gap-3 pointer-events-auto">
+                  <div className="text-center">
+                    <h2 className="text-4xl font-black italic tracking-tighter">WINNER!</h2>
+                    <p className="text-center font-bold">+{lastResult.winAmount.toFixed(2)} {currency.toUpperCase()}</p>
+                  </div>
+                  <Button 
+                    size="sm" 
+                    variant="secondary" 
+                    className="gap-2 bg-white text-emerald-600 hover:bg-white/90 font-bold"
+                    onClick={handleShareWin}
+                    disabled={isSharing}
+                  >
+                    {isSharing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Share2 className="w-4 h-4" />}
+                    Share Win
+                  </Button>
                 </div>
               </motion.div>
             )}

@@ -1,11 +1,14 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { Community } from '../components/Community';
+import { SocialFeed } from '../components/SocialFeed';
 import { useAuth } from '../contexts/AuthContext';
 import { Navigate } from 'react-router-dom';
-import { Users, Shield } from 'lucide-react';
+import { Users, Shield, MessageSquare, Share2 } from 'lucide-react';
+import { cn } from '../lib/utils';
 
 const CommunityPage: React.FC = () => {
   const { user } = useAuth();
+  const [activeTab, setActiveTab] = useState<'feed' | 'boards'>('feed');
 
   if (!user) {
     return <Navigate to="/login" />;
@@ -48,7 +51,39 @@ const CommunityPage: React.FC = () => {
           </div>
         </div>
 
-        <Community user={user} />
+        {/* Tab Navigation */}
+        <div className="flex gap-4 mb-8 bg-zinc-900/50 p-1.5 rounded-2xl border border-zinc-800 w-fit">
+          <button
+            onClick={() => setActiveTab('feed')}
+            className={cn(
+              "flex items-center gap-2 px-6 py-3 rounded-xl text-sm font-black uppercase italic tracking-tighter transition-all",
+              activeTab === 'feed' 
+                ? "bg-emerald-500 text-white shadow-lg shadow-emerald-500/20" 
+                : "text-zinc-500 hover:text-zinc-300 hover:bg-white/5"
+            )}
+          >
+            <Share2 className="w-4 h-4" />
+            Social Feed
+          </button>
+          <button
+            onClick={() => setActiveTab('boards')}
+            className={cn(
+              "flex items-center gap-2 px-6 py-3 rounded-xl text-sm font-black uppercase italic tracking-tighter transition-all",
+              activeTab === 'boards' 
+                ? "bg-emerald-500 text-white shadow-lg shadow-emerald-500/20" 
+                : "text-zinc-500 hover:text-zinc-300 hover:bg-white/5"
+            )}
+          >
+            <MessageSquare className="w-4 h-4" />
+            Discussion Boards
+          </button>
+        </div>
+
+        {activeTab === 'feed' ? (
+          <SocialFeed />
+        ) : (
+          <Community user={user} />
+        )}
       </div>
 
       <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-40">

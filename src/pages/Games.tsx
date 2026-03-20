@@ -9,12 +9,21 @@ import { PlayerBonuses } from '../components/PlayerBonuses';
 
 export default function Games() {
   const [showBonuses, setShowBonuses] = React.useState(false);
+  const [search, setSearch] = React.useState('');
+  const [filterType, setFilterType] = React.useState('all');
+
   const { data: gamesData, isLoading } = useQuery({
     queryKey: ['games'],
     queryFn: async () => {
       const res = await fetch('/api/games');
       return res.json();
     }
+  });
+
+  const filteredGames = gamesData?.games?.filter((game: any) => {
+    const matchesSearch = game.name.toLowerCase().includes(search.toLowerCase());
+    const matchesType = filterType === 'all' || game.type === filterType;
+    return matchesSearch && matchesType;
   });
 
   return (
@@ -67,12 +76,24 @@ export default function Games() {
             <input 
               type="text" 
               placeholder="Search games..." 
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
               className="bg-slate-900/50 border border-white/5 rounded-2xl py-3 pl-12 pr-6 text-sm text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50 w-64 transition-all"
             />
           </div>
-          <Button variant="outline" size="icon" className="h-12 w-12 rounded-2xl border-white/5 hover:bg-white/5">
-            <Filter className="w-5 h-5" />
-          </Button>
+          <div className="flex gap-2">
+            {['all', 'slots', 'crash', 'dice', 'scratch'].map((type) => (
+              <Button 
+                key={type}
+                variant={filterType === type ? 'default' : 'outline'}
+                size="sm"
+                onClick={() => setFilterType(type)}
+                className="rounded-xl border-white/5 capitalize"
+              >
+                {type}
+              </Button>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -82,7 +103,7 @@ export default function Games() {
             <div key={i} className="aspect-[4/5] bg-slate-900/50 rounded-[40px] animate-pulse" />
           ))
         ) : (
-          gamesData?.games?.map((game: any, idx: number) => (
+          filteredGames?.map((game: any, idx: number) => (
             <motion.div
               key={game.id}
               initial={{ opacity: 0, y: 20 }}
@@ -92,7 +113,7 @@ export default function Games() {
             >
               <Link to={`/games/${game.slug}`} className="block h-full">
                 <img 
-                  src={game.image_url} 
+                  src={game.thumbnail_url} 
                   alt={game.name} 
                   className="absolute inset-0 w-full h-full object-cover transition-transform duration-700 group-hover:scale-110"
                   referrerPolicy="no-referrer"

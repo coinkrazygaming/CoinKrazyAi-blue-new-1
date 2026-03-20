@@ -37,6 +37,7 @@ import { cn } from '../lib/utils';
 import FriendsAndInvites from '../components/FriendsAndInvites';
 import { PlayerBonuses } from '../components/PlayerBonuses';
 import AiRecommendations from '../components/AiRecommendations';
+import AvatarCustomizer from '../components/AvatarCustomizer';
 
 export default function Profile() {
   const { user, refreshUser } = useAuth();
@@ -44,6 +45,7 @@ export default function Profile() {
   const [activeTab, setActiveTab] = useState('overview');
   const [cashappTag, setCashappTag] = useState(user?.cashapp_tag || '');
   const [isEditingCashapp, setIsEditingCashapp] = useState(false);
+  const [isCustomizingAvatar, setIsCustomizingAvatar] = useState(false);
 
   const { data: achievementsData } = useQuery({
     queryKey: ['my-achievements'],
@@ -106,9 +108,12 @@ export default function Profile() {
                 <User className="w-16 h-16 md:w-20 md:h-20 text-blue-500/40" />
               )}
             </div>
-            <div className="absolute -bottom-2 -right-2 w-10 h-10 bg-blue-600 rounded-2xl flex items-center justify-center border-4 border-slate-950 shadow-lg cursor-pointer hover:scale-110 transition-transform">
+            <button 
+              onClick={() => setIsCustomizingAvatar(true)}
+              className="absolute -bottom-2 -right-2 w-10 h-10 bg-blue-600 rounded-2xl flex items-center justify-center border-4 border-slate-950 shadow-lg cursor-pointer hover:scale-110 transition-transform"
+            >
               <Settings className="w-5 h-5 text-white" />
-            </div>
+            </button>
           </div>
           
           <div className="flex-1 space-y-3">
@@ -477,6 +482,10 @@ export default function Profile() {
         </div>
       )}
 
+      {/* Avatar Customizer Modal */}
+      {isCustomizingAvatar && (
+        <AvatarCustomizer onClose={() => setIsCustomizingAvatar(false)} />
+      )}
     </div>
   );
 }
